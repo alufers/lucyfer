@@ -1,0 +1,40 @@
+# Development compose: runs lucyfer with a FAKE media clock (free-running
+# CLOCK_MONOTONIC). This is enough to bring the service up and stream audio on a
+# bench, but the fake clock drifts against a real Dante network's PTP clock, so it
+# is NOT suitable for production. For production, replace the `clock` service with a
+# Statime-based PTP client that publishes the usrvclock socket on the shared volume,
+# or drop the sidecar and set `dante.clock_path: /dev/ptp0` (mounting the NIC PHC).
+
+volumes:
+  clock:
+  lucyfer-state:
+
+services:
+  # Dev-only fake usrvclock server (from the inferno test suite).
+  clock:
+    build: ./inferno/test/dockerized_trx/fake_usrvclock_server
+    environment:
+      - USRVCLOCK_SOCKET=/clock/usrvclock
+    volumes:
+      - clock:/clock
+
+  lucyfer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Host networking is required so both Spotify Connect mDNS and Dante's
+    # multicast/unicast discovery + audio reach the LAN.
+    network_mode: host
+    volumes:
+      - ./config.yaml:/etc/lucyfer/config.yaml:ro
+      - lucyfer-state:/var/lib/lucyfer
+      - clock:/clock
+    ulimits:
+      # Allow locking memory for the realtime audio threads.
+      memlock: 200000000
+    cap_add:
+      # Allow the ring-writer thread to raise its scheduling priority.
+      - SYS_NICE
+    depends_on:
+      - clock
+    restart: unless-stopped

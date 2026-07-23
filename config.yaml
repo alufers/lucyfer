@@ -1,0 +1,30 @@
+# Config used by docker-compose.yml (dev). Edit `dante.interface` and
+# `spotify.interface_ip` to match your host, then `docker compose up --build`.
+# See config.example.yaml for the fully documented schema.
+
+dante:
+  interface: "enp0s31f6" # <-- set to your Dante NIC name or its IPv4 address
+  device_name: "lucyfer"
+  sample_rate: 48000
+  tx_latency_ns: 10000000
+  clock_path: "/dev/ptp0" # the fake-clock sidecar's socket (dev)
+  ring_len: 65536
+
+spotify:
+  interface_ip: null # <-- optionally pin the mDNS advertisement to one IP
+  bitrate: 320
+  cache_dir: "./spotify-cache"
+
+speakers:
+  - name: "Living Room"
+    apply_volume: true
+    initial_volume: 0.6
+  - name: "Kitchen"
+    apply_volume: false
+
+audio:
+  pacing_buffer_ms: 150
+  lead_ms: 30
+
+api:
+  bind: "0.0.0.0:8080"

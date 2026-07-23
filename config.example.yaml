@@ -1,0 +1,52 @@
+# lucyfer configuration.
+#
+# Exposes one Spotify Connect speaker per entry in `speakers`, decodes its audio
+# in-process and transmits it as a stereo pair of TX channels on a single Dante
+# device. See README.md for the operational caveats (PTP clock requirement, the
+# librespot discovery bind limitation, licensing).
+
+dante:
+  # BIND_IP passed to inferno: either an IPv4 address or a network interface name.
+  # This is the interface on which Dante audio (and Dante's own mDNS) is sent.
+  interface: "eth0"
+  # Dante device name shown in Dante Controller.
+  device_name: "lucyfer"
+  # Dante network sample rate. Spotify decodes at 44100; anything else is resampled.
+  # A mismatched subscriber sample rate is rejected by inferno, so this must match
+  # the rest of your Dante network (commonly 48000).
+  sample_rate: 48000
+  # Transmit latency in nanoseconds (10 ms here).
+  tx_latency_ns: 10000000
+  # Media clock source. null -> inferno's default usrvclock socket.
+  # Other values: a usrvclock socket path (e.g. "/clock/usrvclock") or "/dev/ptp0".
+  clock_path: null
+  # Per-channel timeline ring buffer length in samples. MUST be a power of two.
+  # 65536 @ 48 kHz ~= 1.37 s of headroom.
+  ring_len: 65536
+
+spotify:
+  # Interface IP advertised over mDNS for the Spotify Connect side. null advertises
+  # on all interfaces. NOTE: only the mDNS advertisement is interface-scoped; the
+  # librespot credential HTTP server always binds all interfaces (see README).
+  interface_ip: null
+  # Audio quality requested from Spotify: 96 | 160 | 320.
+  bitrate: 320
+  # Directory for per-speaker credential + audio cache. null disables caching.
+  cache_dir: "/var/lib/lucyfer/cache"
+
+speakers:
+  - name: "Living Room" # Spotify Connect name; Dante channels "Living Room L" / "Living Room R"
+    apply_volume: true # scale the Dante stream by the Spotify volume
+    initial_volume: 0.6 # 0.0 - 1.0, applied when a session connects
+  - name: "Kitchen"
+    apply_volume: false # send full-scale audio to Dante; report volume only via the API
+
+audio:
+  # Depth of the per-speaker pacing queue in milliseconds. Larger = more robust
+  # against jitter, but higher end-to-end latency.
+  pacing_buffer_ms: 150
+  # How far ahead of the media clock the ring writer fills, in milliseconds.
+  lead_ms: 30
+
+api:
+  bind: "0.0.0.0:8080"

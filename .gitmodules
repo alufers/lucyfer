@@ -1,0 +1,6 @@
+[submodule "inferno"]
+	path = inferno
+	url = https://github.com/teodly/inferno.git
+[submodule "librespot"]
+	path = librespot
+	url = https://github.com/librespot-org/librespot.git
