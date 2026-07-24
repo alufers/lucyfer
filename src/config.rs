@@ -7,7 +7,10 @@ use std::path::Path;
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub dante: DanteConfig,
+    #[serde(default)]
     pub spotify: SpotifyConfig,
+    #[serde(default)]
+    pub airplay: AirPlayConfig,
     pub speakers: Vec<SpeakerConfig>,
     #[serde(default)]
     pub audio: AudioConfig,
@@ -34,6 +37,9 @@ pub struct DanteConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SpotifyConfig {
+    /// Advertise every speaker over Spotify Connect.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// mDNS-advertised IP for the Spotify Connect side. null -> all interfaces.
     #[serde(default)]
     pub interface_ip: Option<String>,
@@ -41,6 +47,23 @@ pub struct SpotifyConfig {
     pub bitrate: u32,
     #[serde(default)]
     pub cache_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AirPlayConfig {
+    /// Advertise every speaker over AirPlay.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Address the RTSP listener binds to. null -> all interfaces.
+    ///
+    /// NOTE: this pins the *listener* only. mDNS is advertised on every interface
+    /// (shairplay registers with `mdns-sd`'s address auto-detection), exactly like the
+    /// Spotify Connect side.
+    #[serde(default)]
+    pub interface_ip: Option<String>,
+    /// RTSP port for the first speaker; speaker N listens on `base_port + N`.
+    #[serde(default = "default_airplay_base_port")]
+    pub base_port: u16,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -65,6 +88,27 @@ pub struct AudioConfig {
 pub struct ApiConfig {
     #[serde(default = "default_api_bind")]
     pub bind: String,
+}
+
+impl Default for SpotifyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interface_ip: None,
+            bitrate: default_bitrate(),
+            cache_dir: None,
+        }
+    }
+}
+
+impl Default for AirPlayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interface_ip: None,
+            base_port: default_airplay_base_port(),
+        }
+    }
 }
 
 impl Default for AudioConfig {
@@ -97,10 +141,23 @@ impl Config {
     fn validate(&self) -> Result<()> {
         anyhow::ensure!(!self.speakers.is_empty(), "at least one speaker required");
         anyhow::ensure!(
+            self.spotify.enabled || self.airplay.enabled,
+            "at least one audio source must be enabled (spotify.enabled / airplay.enabled)"
+        );
+        anyhow::ensure!(
             self.dante.ring_len.is_power_of_two(),
             "dante.ring_len ({}) must be a power of two",
             self.dante.ring_len
         );
+        if self.airplay.enabled {
+            // Speaker N listens on base_port + N, so the whole block must fit.
+            anyhow::ensure!(
+                u16::try_from(self.airplay.base_port as usize + self.speakers.len() - 1).is_ok(),
+                "airplay.base_port ({}) leaves no room for {} speaker(s) below port 65535",
+                self.airplay.base_port,
+                self.speakers.len()
+            );
+        }
         let mut names = std::collections::HashSet::new();
         for sp in &self.speakers {
             anyhow::ensure!(
@@ -135,6 +192,9 @@ fn default_ring_len() -> usize {
 }
 fn default_bitrate() -> u32 {
     320
+}
+fn default_airplay_base_port() -> u16 {
+    5000
 }
 fn default_true() -> bool {
     true
@@ -174,6 +234,55 @@ speakers:
         assert!(!cfg.speakers[1].apply_volume);
         assert_eq!(cfg.spotify.bitrate, 320);
         assert_eq!(cfg.api.bind, "0.0.0.0:8080");
+    }
+
+    #[test]
+    fn both_sources_default_to_enabled() {
+        // An `airplay:` block may be omitted entirely by pre-AirPlay configs.
+        let yaml = r#"
+dante:
+  interface: "eth0"
+spotify: {}
+speakers:
+  - name: "A"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.spotify.enabled);
+        assert!(cfg.airplay.enabled);
+        assert_eq!(cfg.airplay.base_port, 5000);
+    }
+
+    #[test]
+    fn rejects_all_sources_disabled() {
+        let yaml = r#"
+dante:
+  interface: "eth0"
+spotify:
+  enabled: false
+airplay:
+  enabled: false
+speakers:
+  - name: "A"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_airplay_port_block_overflowing() {
+        let yaml = r#"
+dante:
+  interface: "eth0"
+airplay:
+  base_port: 65534
+speakers:
+  - name: "A"
+  - name: "B"
+  - name: "C"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

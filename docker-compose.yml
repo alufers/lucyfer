@@ -22,7 +22,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    # Host networking is required so both Spotify Connect mDNS and Dante's
+    # Host networking is required so Spotify Connect / AirPlay mDNS and Dante's
     # multicast/unicast discovery + audio reach the LAN.
     network_mode: host
     volumes:

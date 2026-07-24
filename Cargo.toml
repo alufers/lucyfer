@@ -2,32 +2,37 @@
 name = "lucyfer"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "GPL-3.0-or-later"
-description = "Spotify Connect speakers bridged to Dante (Audio over IP)"
+description = "Spotify Connect and AirPlay speakers bridged to Dante (Audio over IP)"
 
-# lucyfer is a standalone package. librespot/ and inferno/ are each their own
-# cargo workspace (nested under this dir), so their path-dependency crates resolve
-# workspace inheritance against those roots. We deliberately do NOT declare a
-# [workspace] table here: an empty one would auto-adopt the nested crates as
-# members and break their `edition.workspace = true` inheritance.
+# lucyfer is a standalone package. inferno/ is its own cargo workspace (nested under
+# this dir), so its path-dependency crates resolve workspace inheritance against that
+# root. We deliberately do NOT declare a [workspace] table here: an empty one would
+# auto-adopt the nested crates as members and break their `edition.workspace = true`
+# inheritance.
 [dependencies]
-librespot-core = { path = "librespot/core", default-features = false, features = [
+librespot-core = { version = "0.8", default-features = false, features = [
     "rustls-tls-native-roots",
 ] }
-librespot-playback = { path = "librespot/playback", default-features = false, features = [
+librespot-playback = { version = "0.8", default-features = false, features = [
     "rustls-tls-native-roots",
 ] }
-librespot-connect = { path = "librespot/connect", default-features = false, features = [
+librespot-connect = { version = "0.8", default-features = false, features = [
     "rustls-tls-native-roots",
 ] }
-librespot-discovery = { path = "librespot/discovery", default-features = false, features = [
+librespot-discovery = { version = "0.8", default-features = false, features = [
     "with-libmdns",
     "rustls-tls-native-roots",
 ] }
-librespot-metadata = { path = "librespot/metadata", default-features = false, features = [
+librespot-metadata = { version = "0.8", default-features = false, features = [
     "rustls-tls-native-roots",
 ] }
+
+# AirPlay receiver. Default features = AirPlay 1 only: the `ap2` feature's handlers
+# deliver no metadata/artwork/volume/remote-control callbacks, so AP1 is the only mode
+# that can populate the API's now-playing state.
+shairplay = "0.7"
 
 inferno_aoip = { path = "inferno/inferno_aoip" }
 usrvclock = { path = "inferno/usrvclock-rs" }

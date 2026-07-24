@@ -2,11 +2,11 @@
 
 use super::dto::{ErrorResponse, SeekRequest, VolumeRequest};
 use super::{AppState, dispatch};
-use crate::speaker::CommandResult;
+use crate::source::CommandResult;
 use crate::state::SpeakerState;
 use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use std::sync::Arc;
 
@@ -28,7 +28,20 @@ pub async fn get_speaker(
     }
 }
 
+/// Album art for a speaker. AirPlay pushes raw bytes, which we serve directly; Spotify
+/// gives a CDN URL, which we redirect to.
 pub async fn artwork(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    if let Some(art) = state.hub.get_artwork(&id) {
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, art.content_type),
+                (header::CACHE_CONTROL, "public, max-age=3600"),
+            ],
+            art.bytes,
+        )
+            .into_response();
+    }
     match state.hub.get(&id).and_then(|s| s.track.and_then(|t| t.art_url)) {
         Some(url) => Redirect::temporary(&url).into_response(),
         None => (
@@ -74,15 +87,19 @@ pub async fn volume(
 }
 
 fn run(state: &AppState, id: &str, action: &str, position_ms: Option<u32>, level: Option<f32>) -> Response {
-    let Some(handle) = state.registry.get(id) else {
+    let Some(audio) = state.registry.get(id) else {
         return not_found(id);
     };
-    match dispatch(&handle, action, position_ms, level) {
+    let Some(control) = audio.command_target() else {
+        return inactive();
+    };
+    match dispatch(control.as_ref(), action, position_ms, level) {
         Ok(CommandResult::Ok) => StatusCode::NO_CONTENT.into_response(),
-        Ok(CommandResult::Inactive) => (
-            StatusCode::CONFLICT,
+        Ok(CommandResult::Inactive) => inactive(),
+        Ok(CommandResult::Unsupported) => (
+            StatusCode::NOT_IMPLEMENTED,
             Json(ErrorResponse {
-                error: "speaker_inactive".into(),
+                error: "unsupported_for_source".into(),
             }),
         )
             .into_response(),
@@ -93,6 +110,16 @@ fn run(state: &AppState, id: &str, action: &str, position_ms: Option<u32>, level
             .into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response(),
     }
+}
+
+fn inactive() -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(ErrorResponse {
+            error: "speaker_inactive".into(),
+        }),
+    )
+        .into_response()
 }
 
 fn not_found(id: &str) -> Response {

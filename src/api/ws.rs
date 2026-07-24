@@ -2,7 +2,7 @@
 
 use super::dto::{WsClientMsg, WsServerMsg};
 use super::{AppState, dispatch};
-use crate::speaker::CommandResult;
+use crate::source::CommandResult;
 use crate::state::StateEvent;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -89,7 +89,7 @@ async fn handle_client_msg(
             position_ms,
             level,
         } => {
-            let Some(handle) = state.registry.get(&speaker_id) else {
+            let Some(audio) = state.registry.get(&speaker_id) else {
                 return send(
                     socket,
                     &WsServerMsg::Error {
@@ -98,10 +98,22 @@ async fn handle_client_msg(
                 )
                 .await;
             };
-            let reply = match dispatch(&handle, &action, position_ms, level) {
+            let Some(control) = audio.command_target() else {
+                return send(
+                    socket,
+                    &WsServerMsg::Error {
+                        message: format!("speaker '{speaker_id}' inactive"),
+                    },
+                )
+                .await;
+            };
+            let reply = match dispatch(control.as_ref(), &action, position_ms, level) {
                 Ok(CommandResult::Ok) => WsServerMsg::Ack { speaker_id, action },
                 Ok(CommandResult::Inactive) => WsServerMsg::Error {
                     message: format!("speaker '{speaker_id}' inactive"),
+                },
+                Ok(CommandResult::Unsupported) => WsServerMsg::Error {
+                    message: format!("action '{action}' is unsupported by the active source"),
                 },
                 Ok(CommandResult::Failed(e)) => WsServerMsg::Error { message: e },
                 Err(e) => WsServerMsg::Error { message: e },

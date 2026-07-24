@@ -107,6 +107,10 @@ fn resync_cursor(cursor: Option<usize>, now: usize, lead_samples: usize) -> usiz
 /// Fill one speaker's L/R rings from `cursor` up to (but not including) `target`,
 /// popping frames from `consumer` and writing silence on underrun. Returns the new
 /// cursor.
+///
+/// A pending discard request (raised when a source takes over the speaker, or on an
+/// AirPlay flush) is honoured first: everything queued is thrown away, so the rest of
+/// this cycle silence-fills instead of transmitting the displaced source's audio.
 #[inline]
 fn fill_speaker(
     ring_l: &TimelineRing,
@@ -115,6 +119,9 @@ fn fill_speaker(
     mut cursor: usize,
     target: usize,
 ) -> usize {
+    if consumer.take_discard_request() {
+        tracing::debug!("ring writer discarded queued audio (source switch or flush)");
+    }
     while wrapsub(target, cursor) > 0 {
         let (l, r) = match consumer.pop() {
             Some(frame) => (frame[0], frame[1]),
@@ -151,7 +158,7 @@ mod tests {
         let ring_r = TimelineRing::new(1024);
         let (mut prod, mut cons) = queue::channel(16);
         // Two frames available; request four positions.
-        assert!(prod.push_blocking(&[[111, 222], [333, 444]]));
+        assert_eq!(prod.push_some(&[[111, 222], [333, 444]]), 2);
 
         let end = fill_speaker(&ring_l, &ring_r, &mut cons, 10, 14);
         assert_eq!(end, 14);
@@ -163,6 +170,21 @@ mod tests {
         // Underrun positions are silence.
         assert_eq!(ring_l.read(12), 0);
         assert_eq!(ring_r.read(13), 0);
+    }
+
+    #[test]
+    fn discard_request_drops_queued_audio() {
+        let ring_l = TimelineRing::new(1024);
+        let ring_r = TimelineRing::new(1024);
+        let (mut prod, mut cons) = queue::channel(16);
+        assert_eq!(prod.push_some(&[[111, 222], [333, 444]]), 2);
+        prod.discard_request().request();
+
+        // The queued frames are thrown away, so every position silence-fills.
+        let end = fill_speaker(&ring_l, &ring_r, &mut cons, 10, 12);
+        assert_eq!(end, 12);
+        assert_eq!(ring_l.read(10), 0);
+        assert_eq!(ring_r.read(11), 0);
     }
 
     #[test]

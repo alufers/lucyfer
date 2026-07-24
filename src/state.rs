@@ -1,6 +1,10 @@
 //! Shared per-speaker playback state: a snapshot map (for REST reads) plus a
 //! broadcast channel of updates (for WebSocket streaming).
+//!
+//! Artwork is kept in a side table rather than on `SpeakerState`: Spotify supplies a
+//! CDN URL, but AirPlay pushes raw JPEG/PNG bytes that we have to serve ourselves.
 
+use crate::source::SourceKind;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -10,7 +14,7 @@ use tokio::sync::broadcast;
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Playback {
-    /// No Spotify session has connected to this speaker yet.
+    /// No session from any source has connected to this speaker yet.
     Inactive,
     Stopped,
     Playing,
@@ -28,11 +32,22 @@ pub struct TrackInfo {
     pub art_url: Option<String>,
 }
 
+/// Album art bytes pushed by a source that has no public URL for them (AirPlay).
+#[derive(Debug, Clone)]
+pub struct Artwork {
+    pub bytes: Vec<u8>,
+    pub content_type: &'static str,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SpeakerState {
     pub id: String,
     pub name: String,
     pub apply_volume: bool,
+    /// Sources this speaker is advertised on, in configuration order.
+    pub sources: Vec<SourceKind>,
+    /// Which source currently drives the Dante channels, if any.
+    pub source: Option<SourceKind>,
     pub playback: Playback,
     pub active_user: Option<String>,
     /// 0.0 - 1.0
@@ -46,11 +61,13 @@ pub struct SpeakerState {
 }
 
 impl SpeakerState {
-    pub fn new(id: String, name: String, apply_volume: bool) -> Self {
+    pub fn new(id: String, name: String, apply_volume: bool, sources: Vec<SourceKind>) -> Self {
         Self {
             id,
             name,
             apply_volume,
+            sources,
+            source: None,
             playback: Playback::Inactive,
             active_user: None,
             volume: 0.5,
@@ -87,6 +104,7 @@ pub enum StateEvent {
 pub struct StateHub {
     snapshot: Arc<RwLock<HashMap<String, SpeakerState>>>,
     order: Arc<RwLock<Vec<String>>>,
+    artwork: Arc<RwLock<HashMap<String, Artwork>>>,
     events: broadcast::Sender<StateEvent>,
 }
 
@@ -96,6 +114,7 @@ impl StateHub {
         Self {
             snapshot: Arc::new(RwLock::new(HashMap::new())),
             order: Arc::new(RwLock::new(Vec::new())),
+            artwork: Arc::new(RwLock::new(HashMap::new())),
             events: tx,
         }
     }
@@ -128,6 +147,22 @@ impl StateHub {
 
     pub fn get(&self, id: &str) -> Option<SpeakerState> {
         self.snapshot.read().unwrap().get(id).map(|s| s.extrapolated())
+    }
+
+    /// Store album art bytes for a speaker, replacing any previous cover.
+    pub fn set_artwork(&self, id: &str, artwork: Artwork) {
+        self.artwork
+            .write()
+            .unwrap()
+            .insert(id.to_string(), artwork);
+    }
+
+    pub fn get_artwork(&self, id: &str) -> Option<Artwork> {
+        self.artwork.read().unwrap().get(id).cloned()
+    }
+
+    pub fn clear_artwork(&self, id: &str) {
+        self.artwork.write().unwrap().remove(id);
     }
 
     /// All speakers in registration order, with positions extrapolated.

@@ -4,7 +4,7 @@ pub mod dto;
 mod rest;
 mod ws;
 
-use crate::speaker::{CommandResult, SpeakerHandle, SpeakerRegistry};
+use crate::source::{CommandResult, SourceControl, SpeakerRegistry};
 use crate::state::StateHub;
 use axum::Router;
 use axum::routing::{get, post};
@@ -36,30 +36,27 @@ pub fn router(hub: StateHub, registry: SpeakerRegistry) -> Router {
         .with_state(state)
 }
 
-/// Apply a named action to a speaker handle. Shared by REST and WS.
+/// Apply a named action to whichever source currently drives a speaker. Shared by REST
+/// and WS. `Err` means the request itself was malformed (400).
 pub fn dispatch(
-    handle: &SpeakerHandle,
+    control: &dyn SourceControl,
     action: &str,
     position_ms: Option<u32>,
     level: Option<f32>,
 ) -> Result<CommandResult, String> {
     let result = match action {
-        "play" => handle.with_spirc(|s| {
-            s.activate()?;
-            s.play()
-        }),
-        "pause" => handle.with_spirc(|s| s.pause()),
-        "playpause" => handle.with_spirc(|s| s.play_pause()),
-        "next" => handle.with_spirc(|s| s.next()),
-        "previous" => handle.with_spirc(|s| s.prev()),
+        "play" => control.play(),
+        "pause" => control.pause(),
+        "playpause" => control.play_pause(),
+        "next" => control.next(),
+        "previous" => control.previous(),
         "seek" => {
             let pos = position_ms.ok_or_else(|| "seek requires position_ms".to_string())?;
-            handle.with_spirc(|s| s.set_position_ms(pos))
+            control.seek(pos)
         }
         "volume" => {
             let level = level.ok_or_else(|| "volume requires level".to_string())?;
-            let v = (level.clamp(0.0, 1.0) * u16::MAX as f32) as u16;
-            handle.with_spirc(|s| s.set_volume(v))
+            control.set_volume(level)
         }
         other => return Err(format!("unknown action '{other}'")),
     };

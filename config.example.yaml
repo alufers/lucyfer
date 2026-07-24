@@ -1,9 +1,11 @@
 # lucyfer configuration.
 #
-# Exposes one Spotify Connect speaker per entry in `speakers`, decodes its audio
-# in-process and transmits it as a stereo pair of TX channels on a single Dante
-# device. See README.md for the operational caveats (PTP clock requirement, the
-# librespot discovery bind limitation, licensing).
+# Exposes one speaker per entry in `speakers` — advertised over every enabled source
+# (Spotify Connect and AirPlay) at once — decodes its audio in-process and transmits it
+# as a stereo pair of TX channels on a single Dante device. Only one source drives a
+# speaker at a time; the most recent one to start playing takes over and the other is
+# paused. See README.md for the operational caveats (PTP clock requirement, the mDNS
+# bind limitation, licensing).
 
 dante:
   # BIND_IP passed to inferno: either an IPv4 address or a network interface name.
@@ -25,6 +27,8 @@ dante:
   ring_len: 65536
 
 spotify:
+  # Advertise every speaker over Spotify Connect.
+  enabled: true
   # Interface IP advertised over mDNS for the Spotify Connect side. null advertises
   # on all interfaces. NOTE: only the mDNS advertisement is interface-scoped; the
   # librespot credential HTTP server always binds all interfaces (see README).
@@ -34,16 +38,27 @@ spotify:
   # Directory for per-speaker credential + audio cache. null disables caching.
   cache_dir: "/var/lib/lucyfer/cache"
 
+airplay:
+  # Advertise every speaker over AirPlay (AirPlay 1 / RAOP).
+  enabled: true
+  # Address the RTSP listener binds to. null binds all interfaces. NOTE: this pins the
+  # listener only — the mDNS advertisement always covers every interface (see README).
+  interface_ip: null
+  # RTSP port for the first speaker; speaker N listens on base_port + N. With the two
+  # speakers below that is 5000 and 5001.
+  base_port: 5000
+
 speakers:
-  - name: "Living Room" # Spotify Connect name; Dante channels "Living Room L" / "Living Room R"
-    apply_volume: true # scale the Dante stream by the Spotify volume
-    initial_volume: 0.6 # 0.0 - 1.0, applied when a session connects
+  - name: "Living Room" # name shown in Spotify and AirPlay; Dante channels "Living Room L" / "Living Room R"
+    apply_volume: true # scale the Dante stream by the source's volume
+    initial_volume: 0.6 # 0.0 - 1.0, applied when a Spotify session connects
   - name: "Kitchen"
     apply_volume: false # send full-scale audio to Dante; report volume only via the API
 
 audio:
   # Depth of the per-speaker pacing queue in milliseconds. Larger = more robust
-  # against jitter, but higher end-to-end latency.
+  # against jitter, but higher end-to-end latency. AirPlay also keeps this queue about
+  # half full to absorb sender-clock drift, so it sets the AirPlay latency too.
   pacing_buffer_ms: 150
   # How far ahead of the media clock the ring writer fills, in milliseconds.
   lead_ms: 30

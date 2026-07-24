@@ -15,9 +15,15 @@ dante:
   ring_len: 65536
 
 spotify:
+  enabled: true
   interface_ip: null # <-- optionally pin the mDNS advertisement to one IP
   bitrate: 320
   cache_dir: "./spotify-cache"
+
+airplay:
+  enabled: true
+  interface_ip: null # <-- optionally pin the RTSP listener to one IP
+  base_port: 5000 # speaker N listens on base_port + N
 
 speakers:
   - name: "Eleleab"

@@ -1,21 +1,27 @@
-//! lucyfer — expose Spotify Connect speakers and transmit their audio over Dante.
+//! lucyfer — expose Spotify Connect and AirPlay speakers, transmitting their audio
+//! over Dante.
 
 mod api;
 mod audio;
 mod config;
 mod dante;
-mod speaker;
+mod source;
 mod state;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use config::Config;
+use source::{SourceKind, SpeakerAudio, SpeakerRegistry, speaker_id};
 use state::{SpeakerState, StateHub};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
-#[command(name = "lucyfer", version, about = "Spotify Connect -> Dante bridge")]
+#[command(
+    name = "lucyfer",
+    version,
+    about = "Spotify Connect / AirPlay -> Dante bridge"
+)]
 struct Args {
     /// Path to the YAML configuration file.
     #[arg(short, long, default_value = "/etc/lucyfer/config.yaml")]
@@ -33,29 +39,56 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let cfg = Config::load(&args.config)?;
-    tracing::info!("loaded config with {} speaker(s)", cfg.speakers.len());
+
+    let mut sources = Vec::new();
+    if cfg.spotify.enabled {
+        sources.push(SourceKind::Spotify);
+    }
+    if cfg.airplay.enabled {
+        sources.push(SourceKind::Airplay);
+    }
+    tracing::info!(
+        "loaded config with {} speaker(s), sources: {}",
+        cfg.speakers.len(),
+        sources
+            .iter()
+            .map(|s| s.label())
+            .collect::<Vec<_>>()
+            .join(" + ")
+    );
 
     let hub = StateHub::new();
-    let (registry, handles) = speaker::build_registry(&cfg.speakers);
 
-    // Register initial state and build one pacing queue per speaker.
+    // One pacing queue per speaker, shared by every source through `SpeakerAudio`.
     let pacing_frames =
         (cfg.dante.sample_rate as u64 * cfg.audio.pacing_buffer_ms as u64 / 1000) as usize;
-    let lead_samples =
-        (cfg.dante.sample_rate as u64 * cfg.audio.lead_ms as u64 / 1000) as usize;
+    let lead_samples = (cfg.dante.sample_rate as u64 * cfg.audio.lead_ms as u64 / 1000) as usize;
 
-    let mut producers = Vec::new();
+    let registry = SpeakerRegistry::new();
+    let mut speaker_audio = Vec::new();
     let mut consumers = Vec::new();
     let mut speaker_names = Vec::new();
     for sp in &cfg.speakers {
+        let id = speaker_id(&sp.name);
         hub.register(SpeakerState::new(
-            speaker::speaker_id(&sp.name),
+            id.clone(),
             sp.name.clone(),
             sp.apply_volume,
+            sources.clone(),
         ));
-        let (prod, cons) = audio::queue::channel(pacing_frames);
-        producers.push(Arc::new(Mutex::new(prod)));
-        consumers.push(cons);
+        let (producer, consumer) = audio::queue::channel(pacing_frames);
+        let audio = Arc::new(SpeakerAudio::new(
+            id,
+            sp.name.clone(),
+            hub.clone(),
+            producer,
+            // Real-time sources (AirPlay) keep the queue around half full so a
+            // free-running sender clock has drift headroom in both directions.
+            pacing_frames / 2,
+        ));
+        registry.insert(audio.clone());
+        speaker_audio.push(audio);
+        consumers.push(consumer);
         speaker_names.push(sp.name.clone());
     }
 
@@ -66,23 +99,42 @@ async fn main() -> Result<()> {
         .await
         .context("starting Dante output")?;
 
-    // Spawn one discovery/session loop per speaker.
-    let mut speaker_tasks = Vec::new();
-    for ((sp, producer), handle) in cfg
-        .speakers
-        .iter()
-        .cloned()
-        .zip(producers.into_iter())
-        .zip(handles.into_iter())
-    {
-        let spotify = cfg.spotify.clone();
-        let hub = hub.clone();
-        let rate = cfg.dante.sample_rate;
-        speaker_tasks.push(tokio::spawn(async move {
-            if let Err(e) = speaker::run_speaker(sp, spotify, producer, rate, hub, handle).await {
-                tracing::error!("speaker task ended with error: {e:#}");
-            }
-        }));
+    // Spawn one task per (speaker, enabled source).
+    let mut source_tasks = Vec::new();
+    for (index, (sp, audio)) in cfg.speakers.iter().zip(speaker_audio.iter()).enumerate() {
+        if cfg.spotify.enabled {
+            let (sp, spotify, audio, hub) = (
+                sp.clone(),
+                cfg.spotify.clone(),
+                audio.clone(),
+                hub.clone(),
+            );
+            let rate = cfg.dante.sample_rate;
+            source_tasks.push(tokio::spawn(async move {
+                let name = sp.name.clone();
+                if let Err(e) = source::spotify::run_speaker(sp, spotify, audio, rate, hub).await {
+                    tracing::error!("speaker '{name}' Spotify source ended with error: {e:#}");
+                }
+            }));
+        }
+        if cfg.airplay.enabled {
+            let (sp, airplay, audio, hub) = (
+                sp.clone(),
+                cfg.airplay.clone(),
+                audio.clone(),
+                hub.clone(),
+            );
+            let rate = cfg.dante.sample_rate;
+            let port = cfg.airplay.base_port + index as u16;
+            source_tasks.push(tokio::spawn(async move {
+                let name = sp.name.clone();
+                if let Err(e) =
+                    source::airplay::run_speaker(sp, airplay, port, audio, rate, hub).await
+                {
+                    tracing::error!("speaker '{name}' AirPlay source ended with error: {e:#}");
+                }
+            }));
+        }
     }
 
     // Serve the API.
@@ -99,7 +151,7 @@ async fn main() -> Result<()> {
     }
 
     tracing::info!("shutting down");
-    for t in speaker_tasks {
+    for t in source_tasks {
         t.abort();
     }
     dante.shutdown().await;

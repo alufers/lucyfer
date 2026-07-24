@@ -1,15 +1,17 @@
-//! Sample-rate conversion from librespot's fixed 44.1 kHz stereo f64 output to the
-//! configured Dante rate, producing interleaved `Frame`s of MSB-aligned i32.
+//! Sample-rate conversion from a source's stereo PCM output to the configured Dante
+//! rate, producing interleaved `Frame`s of MSB-aligned i32.
 //!
-//! `Bypass` is used when the Dante rate is already 44100 (bit-exact passthrough).
+//! Both audio sources feed this: librespot delivers f64 @ 44.1 kHz, shairplay
+//! (AirPlay) delivers f32 at the stream's native rate (44.1 kHz for AirPlay 1 ALAC).
+//!
+//! `Bypass` is used when the input and output rates match (bit-exact passthrough).
 //! Otherwise an FFT resampler with a fixed input chunk is fed from an accumulation
-//! buffer, since librespot delivers variable-sized packets.
+//! buffer, since sources deliver variable-sized packets.
 
 use super::queue::Frame;
 use inferno_aoip::device_server::Sample;
 use rubato::{FftFixedIn, Resampler};
 
-const SPOTIFY_RATE: usize = 44_100;
 const CHUNK_IN: usize = 1024;
 const SUB_CHUNKS: usize = 2;
 const CHANNELS: usize = 2;
@@ -28,13 +30,13 @@ pub struct FftState {
 }
 
 impl SpeakerResampler {
-    /// Build a resampler for the given output rate. `out_rate == 44100` -> `Bypass`.
-    pub fn new(out_rate: u32) -> anyhow::Result<Self> {
-        if out_rate as usize == SPOTIFY_RATE {
+    /// Build a resampler between the two rates. Equal rates -> `Bypass`.
+    pub fn new(in_rate: u32, out_rate: u32) -> anyhow::Result<Self> {
+        if in_rate == out_rate {
             return Ok(SpeakerResampler::Bypass);
         }
         let resampler = FftFixedIn::<f32>::new(
-            SPOTIFY_RATE,
+            in_rate as usize,
             out_rate as usize,
             CHUNK_IN,
             SUB_CHUNKS,
@@ -48,7 +50,7 @@ impl SpeakerResampler {
         }))
     }
 
-    /// Reset internal buffers (called on sink start).
+    /// Reset internal buffers (called on sink start / stream flush).
     pub fn reset(&mut self) {
         if let SpeakerResampler::Fft(s) = self {
             s.in_buf[0].clear();
@@ -56,7 +58,7 @@ impl SpeakerResampler {
         }
     }
 
-    /// Consume interleaved stereo f64 (44.1 kHz) and append output frames to `out`.
+    /// Consume interleaved stereo f64 (librespot) and append output frames to `out`.
     pub fn process(&mut self, interleaved: &[f64], out: &mut Vec<Frame>) {
         match self {
             SpeakerResampler::Bypass => {
@@ -64,16 +66,34 @@ impl SpeakerResampler {
                     out.push([f64_to_sample(pair[0]), f64_to_sample(pair[1])]);
                 }
             }
-            SpeakerResampler::Fft(s) => s.process(interleaved, out),
+            SpeakerResampler::Fft(s) => {
+                s.process(interleaved.chunks_exact(2).map(|p| (p[0] as f32, p[1] as f32)), out)
+            }
+        }
+    }
+
+    /// Consume interleaved stereo f32 (AirPlay) and append output frames to `out`.
+    pub fn process_f32(&mut self, interleaved: &[f32], out: &mut Vec<Frame>) {
+        match self {
+            SpeakerResampler::Bypass => {
+                for pair in interleaved.chunks_exact(2) {
+                    out.push([f32_to_sample(pair[0]), f32_to_sample(pair[1])]);
+                }
+            }
+            SpeakerResampler::Fft(s) => {
+                s.process(interleaved.chunks_exact(2).map(|p| (p[0], p[1])), out)
+            }
         }
     }
 }
 
 impl FftState {
-    fn process(&mut self, interleaved: &[f64], out: &mut Vec<Frame>) {
-        for pair in interleaved.chunks_exact(2) {
-            self.in_buf[0].push(pair[0] as f32);
-            self.in_buf[1].push(pair[1] as f32);
+    /// Accumulate deinterleaved input and drain it through the resampler one fixed
+    /// chunk at a time. Shared by both public entry points.
+    fn process<I: Iterator<Item = (f32, f32)>>(&mut self, frames: I, out: &mut Vec<Frame>) {
+        for (l, r) in frames {
+            self.in_buf[0].push(l);
+            self.in_buf[1].push(r);
         }
 
         while self.in_buf[0].len() >= CHUNK_IN {
@@ -113,6 +133,8 @@ fn f32_to_sample(x: f32) -> Sample {
 mod tests {
     use super::*;
 
+    const SPOTIFY_RATE: usize = 44_100;
+
     fn make_sine(rate: usize, freq: f64, n: usize) -> Vec<f64> {
         let mut v = Vec::with_capacity(n * 2);
         for i in 0..n {
@@ -125,9 +147,9 @@ mod tests {
 
     #[test]
     fn bypass_is_bit_exact() {
-        let mut r = SpeakerResampler::new(44100).unwrap();
+        let mut r = SpeakerResampler::new(44100, 44100).unwrap();
         assert!(matches!(r, SpeakerResampler::Bypass));
-        let inp = make_sine(44100, 1000.0, 512);
+        let inp = make_sine(SPOTIFY_RATE, 1000.0, 512);
         let mut out = Vec::new();
         r.process(&inp, &mut out);
         assert_eq!(out.len(), 512);
@@ -137,10 +159,24 @@ mod tests {
     }
 
     #[test]
+    fn bypass_f32_is_bit_exact() {
+        let mut r = SpeakerResampler::new(44100, 44100).unwrap();
+        let inp: Vec<f32> = make_sine(SPOTIFY_RATE, 1000.0, 512)
+            .into_iter()
+            .map(|x| x as f32)
+            .collect();
+        let mut out = Vec::new();
+        r.process_f32(&inp, &mut out);
+        assert_eq!(out.len(), 512);
+        assert_eq!(out[100][0], f32_to_sample(inp[200]));
+        assert_eq!(out[100][0], out[100][1]);
+    }
+
+    #[test]
     fn upsample_ratio_and_peak() {
-        let mut r = SpeakerResampler::new(48000).unwrap();
+        let mut r = SpeakerResampler::new(44100, 48000).unwrap();
         let n_in = 44100; // 1 second
-        let inp = make_sine(44100, 1000.0, n_in);
+        let inp = make_sine(SPOTIFY_RATE, 1000.0, n_in);
         let mut out = Vec::new();
         r.process(&inp, &mut out);
         // Roughly n_in * 48000 / 44100, minus at most one input chunk of latency.
@@ -161,5 +197,22 @@ mod tests {
             peak,
             target
         );
+    }
+
+    #[test]
+    fn upsample_f32_matches_f64_path() {
+        let inp = make_sine(SPOTIFY_RATE, 1000.0, 8192);
+        let inp32: Vec<f32> = inp.iter().map(|&x| x as f32).collect();
+
+        let mut a = SpeakerResampler::new(44100, 48000).unwrap();
+        let mut out_a = Vec::new();
+        a.process(&inp, &mut out_a);
+
+        let mut b = SpeakerResampler::new(44100, 48000).unwrap();
+        let mut out_b = Vec::new();
+        b.process_f32(&inp32, &mut out_b);
+
+        // Both entry points feed the identical f32 pipeline, so results are equal.
+        assert_eq!(out_a, out_b);
     }
 }

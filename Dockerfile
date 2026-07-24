@@ -1,6 +1,6 @@
-# Build context MUST be the repo root so that librespot/ and inferno/ (the path
-# dependencies, with their git submodules checked out) are included. Initialise
-# the inferno submodules before building:
+# Build context MUST be the repo root so that inferno/ (the path dependency, with its
+# git submodules checked out) is included. Initialise the inferno submodules before
+# building:
 #   git submodule update --init --recursive
 # (searchfire, usrvclock-rs and alsa-sys-all under inferno/).
 
@@ -9,7 +9,6 @@ WORKDIR /build
 
 # Manifests first for better layer caching of the dependency build.
 COPY Cargo.toml Cargo.lock ./
-COPY librespot ./librespot
 COPY inferno ./inferno
 COPY src ./src
 
