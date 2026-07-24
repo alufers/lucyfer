@@ -3,11 +3,15 @@
 # See config.example.yaml for the fully documented schema.
 
 dante:
-  interface: "enp0s31f6" # <-- set to your Dante NIC name or its IPv4 address
+  interface: "enp195s0f0" # <-- set to your Dante NIC name or its IPv4 address
   device_name: "lucyfer"
   sample_rate: 48000
   tx_latency_ns: 10000000
-  clock_path: "/dev/ptp0" # the fake-clock sidecar's socket (dev)
+  # Media clock source. This host has no PTP hardware clock, so point this at the
+  # usrvclock socket published by a PTP daemon (Statime/ptp4l bridge). null uses
+  # inferno's default socket (/tmp/ptp-usrvclock). Use "/dev/ptp0" only on a host
+  # whose NIC PHC is already PTP-synced.
+  clock_path: "/tmp/ptp-usrvclock"
   ring_len: 65536
 
 spotify:
@@ -16,10 +20,10 @@ spotify:
   cache_dir: "./spotify-cache"
 
 speakers:
-  - name: "Living Room"
-    apply_volume: true
+  - name: "Eleleab"
+    apply_volume: false
     initial_volume: 0.6
-  - name: "Kitchen"
+  - name: "Audytorium"
     apply_volume: false
 
 audio:

@@ -131,6 +131,7 @@ impl DanteOutput {
             tx_channels,
             cfg.sample_rate
         );
+        describe_clock_source(&cfg.clock_path);
         let mut server = DeviceServer::start(settings).await;
         let sample_rate = cfg.sample_rate as u64;
 
@@ -166,12 +167,13 @@ impl DanteOutput {
         // once the clock arrives). Blocking here would gate discovery on the clock.
         {
             let clock_rx = server.get_realtime_clock_receiver();
+            let clock_path = cfg.clock_path.clone();
             tokio::spawn(async move {
                 tracing::warn!(
                     "Dante TX is waiting for a media clock (PTP/usrvclock); \
                      no audio will be transmitted until one is available"
                 );
-                let start_ts = wait_for_clock(clock_rx, sample_rate).await;
+                let start_ts = wait_for_clock(clock_rx, sample_rate, clock_path).await;
                 let _ = start_tx.send(start_ts);
                 tracing::info!("Dante media clock acquired; TX timeline anchored");
             });
@@ -228,11 +230,59 @@ impl DanteOutput {
     }
 }
 
+/// The effective media-clock source path: the configured `clock_path`, or inferno's
+/// default usrvclock socket when unset.
+fn resolve_clock_path(clock_path: &Option<String>) -> String {
+    clock_path
+        .clone()
+        .unwrap_or_else(|| usrvclock::DEFAULT_SERVER_SOCKET_PATH.to_string())
+}
+
+/// Log the effective media-clock source at startup so a missing or invalid one is
+/// obvious. This never fails or aborts: by design the service still comes up without a
+/// clock (discovery + API), and only audio TX is gated until a clock arrives.
+fn describe_clock_source(clock_path: &Option<String>) {
+    use std::os::unix::fs::FileTypeExt;
+
+    let path = resolve_clock_path(clock_path);
+    match std::fs::metadata(&path) {
+        Ok(md) => {
+            let ft = md.file_type();
+            if ft.is_char_device() {
+                tracing::info!("media clock: using PTP char device '{path}'");
+            } else if ft.is_socket() {
+                tracing::info!("media clock: using usrvclock server socket '{path}'");
+            } else {
+                tracing::warn!(
+                    "media clock: '{path}' is neither a char device nor a socket, so it \
+                     is almost certainly not a valid clock source. Set dante.clock_path \
+                     to a PTP char device (e.g. /dev/ptp0) or a usrvclock socket."
+                );
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::error!(
+                "media clock: '{path}' does not exist — no PTP char device and no \
+                 usrvclock server socket. NO AUDIO will be transmitted until a media \
+                 clock is available. Run a PTP daemon that publishes a usrvclock socket \
+                 (Statime/ptp4l bridge) and point dante.clock_path at it, or set it to a \
+                 PTP char device such as /dev/ptp0."
+            );
+        }
+        Err(e) => {
+            tracing::warn!("media clock: cannot stat '{path}': {e}");
+        }
+    }
+}
+
 async fn wait_for_clock(
     mut clock_rx: inferno_aoip::device_server::RealTimeClockReceiver,
     sample_rate: u64,
+    clock_path: Option<String>,
 ) -> usize {
+    let resolved = resolve_clock_path(&clock_path);
     let mut media_clock = MediaClock::new(false);
+    let mut iters: u64 = 0;
     loop {
         clock_rx.update();
         if let Some(overlay) = clock_rx.get() {
@@ -240,6 +290,16 @@ async fn wait_for_clock(
             if let Some(now) = media_clock.wrapping_now_in_timebase(sample_rate) {
                 return now as usize;
             }
+        }
+        iters += 1;
+        // ~100 ms per iteration; re-warn every ~10 s so a stuck clock is visible in a
+        // log tail, not just a single line at boot.
+        if iters % 100 == 0 {
+            tracing::warn!(
+                "still waiting for a media clock from '{resolved}' after {} s; \
+                 no audio is being transmitted",
+                iters / 10
+            );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

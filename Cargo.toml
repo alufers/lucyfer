@@ -30,6 +30,7 @@ librespot-metadata = { path = "librespot/metadata", default-features = false, fe
 ] }
 
 inferno_aoip = { path = "inferno/inferno_aoip" }
+usrvclock = { path = "inferno/usrvclock-rs" }
 
 tokio = { version = "1", features = [
     "rt-multi-thread",
@@ -55,6 +56,3 @@ anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 thread-priority = "1"
-
-[dev-dependencies]
-usrvclock = { path = "inferno/usrvclock-rs" }

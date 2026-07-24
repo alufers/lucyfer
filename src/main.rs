@@ -59,7 +59,9 @@ async fn main() -> Result<()> {
         speaker_names.push(sp.name.clone());
     }
 
-    // Start the Dante device + ring writer. This blocks until a media clock is up.
+    // Start the Dante device + ring writer. Startup does NOT block on the media clock:
+    // discovery and the API come up immediately; only audio TX is gated until a media
+    // clock (PTP/usrvclock) becomes available.
     let dante = dante::DanteOutput::start(&cfg.dante, &speaker_names, consumers, lead_samples)
         .await
         .context("starting Dante output")?;
