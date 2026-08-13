@@ -1,0 +1,44 @@
+# Default config for the bundled Statime PTP daemon (teodly/statime, inferno-dev),
+# baked into the image at /etc/lucyfer/statime.toml. Used when LUCYFER_PTP is
+# enabled and nothing is mounted over it; override by mounting your own file there
+# or by pointing LUCYFER_PTP_CONFIG somewhere else.
+#
+# Dante speaks PTPv1, which ptp4l cannot do — hence this fork rather than linuxptp.
+
+loglevel = "info" # bump to "debug"/"trace" while commissioning
+
+sdo-id = 0
+domain = 0
+priority1 = 251 # never win the election; a Dante device stays grandmaster
+
+# PTP clock identity, 8 bytes of hex (EUI-64 of a MAC, by convention). Pinned so it
+# survives a container MAC change. **Give every instance on a network its own
+# value.**
+#
+# The container also needs a *globally administered* MAC — give it one with
+# `mac_address:` in compose. Statime derives an identity from the interface MAC and
+# rejects locally administered addresses such as Docker's default 02:42:…, and it
+# evaluates that fallback eagerly (`unwrap_or`), so it panics with "could not get
+# clock identity" even with this setting present.
+identity = "00163efffe6c7563"
+
+# Discipline a virtual clock derived from CLOCK_MONOTONIC_RAW instead of the system
+# clock, so PTP never writes CLOCK_REALTIME and cannot fight the host's NTP daemon.
+virtual-system-clock = true
+virtual-system-clock-base = "monotonic_raw"
+
+# Publish the media clock for inferno. This is usrvclock's default path, which is
+# also what lucyfer uses when `dante.clock_path` is null.
+usrvclock-export = true
+usrvclock-path = "/tmp/ptp-usrvclock"
+
+[[port]]
+# The container's own interface. With a macvlan/ipvlan network this is the NIC on
+# the audio VLAN; with `network_mode: host` set it to the host interface instead.
+interface = "eth0"
+network-mode = "ipv4"
+protocol-version = "PTPv1"
+# Software timestamping. A macvlan interface cannot drive the parent NIC's PHC;
+# switch to "auto" only when the daemon runs on a real interface with a PHC (and
+# then give the container CAP_NET_ADMIN and the /dev/ptpN device).
+hardware-clock = "none"

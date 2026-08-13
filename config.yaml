@@ -7,11 +7,11 @@ dante:
   device_name: "lucyfer"
   sample_rate: 48000
   tx_latency_ns: 10000000
-  # Media clock source. This host has no PTP hardware clock, so point this at the
-  # usrvclock socket published by a PTP daemon (Statime/ptp4l bridge). null uses
-  # inferno's default socket (/tmp/ptp-usrvclock). Use "/dev/ptp0" only on a host
-  # whose NIC PHC is already PTP-synced.
-  clock_path: "/tmp/ptp-usrvclock"
+  # Media clock source. This dev setup takes it from the fake usrvclock sidecar in
+  # docker-compose.yml, which publishes its socket on the shared `clock` volume.
+  # In production the bundled Statime daemon (LUCYFER_PTP=1) publishes it at
+  # inferno's default path instead, and this can be null.
+  clock_path: "/clock/usrvclock"
   ring_len: 65536
 
 spotify:
@@ -26,12 +26,16 @@ airplay:
   base_port: 5000 # speaker N listens on base_port + N
 
 speakers:
-  - name: "Eleleab"
+  - name: "Elelab"
     apply_volume: false
     initial_volume: 0.6
   - name: "Audytorium"
     apply_volume: false
-
+  - name: "Arts and Crafts"
+  - name: "Kuźnia"
+  - name: "CNC"
+  - name: "Maszynownia"
+    
 audio:
   pacing_buffer_ms: 150
   lead_ms: 30

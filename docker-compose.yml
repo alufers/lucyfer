@@ -1,9 +1,10 @@
 # Development compose: runs lucyfer with a FAKE media clock (free-running
 # CLOCK_MONOTONIC). This is enough to bring the service up and stream audio on a
 # bench, but the fake clock drifts against a real Dante network's PTP clock, so it
-# is NOT suitable for production. For production, replace the `clock` service with a
-# Statime-based PTP client that publishes the usrvclock socket on the shared volume,
-# or drop the sidecar and set `dante.clock_path: /dev/ptp0` (mounting the NIC PHC).
+# is NOT suitable for production. For production, drop the `clock` sidecar and set
+# LUCYFER_PTP=1 to run the bundled Statime PTP daemon inside the lucyfer container
+# (see README.md "Production clocking" and deploy/), or set
+# `dante.clock_path: /dev/ptp0` on a host whose PHC is already disciplined.
 
 volumes:
   clock:
@@ -25,6 +26,12 @@ services:
     # Host networking is required so Spotify Connect / AirPlay mDNS and Dante's
     # multicast/unicast discovery + audio reach the LAN.
     network_mode: host
+    environment:
+      # The usrvclock client binds its reply socket under $TMPDIR and the server
+      # (a separate container here) has to be able to open that path, so both ends
+      # live on the shared volume. Not needed in production, where the PTP daemon
+      # runs inside this container — see deploy/docker-compose.prod.yml.
+      - TMPDIR=/clock
     volumes:
       - ./config.yaml:/etc/lucyfer/config.yaml:ro
       - lucyfer-state:/var/lib/lucyfer

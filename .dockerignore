@@ -3,5 +3,10 @@ target
 inferno/test
 inferno/devtools
 inferno/os_integration
+statime/docs
+statime/fuzz
+statime/testing-rpi
+statime/validation
+statime/statime-stm32
 **/.git
 .git

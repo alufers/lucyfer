@@ -1,3 +1,7 @@
 [submodule "inferno"]
 	path = inferno
 	url = https://github.com/teodly/inferno.git
+[submodule "statime"]
+	path = statime
+	url = https://github.com/teodly/statime.git
+	branch = inferno-dev

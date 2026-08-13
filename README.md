@@ -21,6 +21,11 @@ Libraries it builds on:
 
 Because it links `inferno_aoip`, **lucyfer is licensed GPL-3.0-or-later.**
 
+The Docker image additionally ships — as a separate binary, not a linked dependency —
+[teodly's Statime fork](https://github.com/teodly/statime/tree/inferno-dev) (the
+`statime/` submodule, Apache-2.0 OR MIT), the PTPv1 daemon that provides the Dante
+media clock. See [Production clocking](#production-clocking).
+
 ## How it works
 
 ```
@@ -145,10 +150,11 @@ WebSocket, `GET /api/v1/ws`:
 
 ### Prerequisites
 
-The inferno path dependency uses git submodules. After cloning:
+Both the inferno path dependency and the bundled `statime/` PTP daemon are git
+submodules with submodules of their own. After cloning:
 
 ```sh
-cd inferno && git submodule update --init --recursive && cd ..
+git submodule update --init --recursive
 ```
 
 ### Local (needs a media clock)
@@ -169,7 +175,7 @@ cargo run --release -- --config config.example.yaml
 ### Docker
 
 ```sh
-git -C inferno submodule update --init --recursive
+git submodule update --init --recursive
 # edit config.yaml: set dante.interface (and optionally the per-source interface_ip)
 docker compose up --build
 ```
@@ -180,15 +186,47 @@ mDNS + Dante multicast), a state volume, `memlock` ulimit and `SYS_NICE`.
 ## Production clocking
 
 The fake clock free-runs on `CLOCK_MONOTONIC` and **drifts against a real Dante
-network**. For production, provide a real PTP-derived clock:
+network**, so production needs a real PTP-derived clock. Dante speaks **PTPv1**,
+which `ptp4l` cannot do — the daemon that can is
+[teodly's Statime fork](https://github.com/teodly/statime/tree/inferno-dev), and the
+image **bundles** it (built from the `statime/` submodule, shipped as
+`/usr/local/bin/statime`).
 
-- Run [Statime](https://github.com/pendulum-project/statime) (or `ptp4l`) synced to
-  the Dante grandmaster and bridge it to a usrvclock socket that lucyfer reads
-  (`clock_path`), **or**
-- Set `dante.clock_path: /dev/ptp0` and give the container the NIC's PHC
-  (`devices: [/dev/ptp0]`) when it is already PTP-synced.
+Enable it with an environment variable:
 
-See inferno's README "Clocking options" for details.
+| Variable | Meaning |
+| --- | --- |
+| `LUCYFER_PTP` | `1`/`true`/`yes`/`on` runs the PTP daemon alongside lucyfer. **Unset (default) = off**: lucyfer alone, expecting a media clock from elsewhere. |
+| `LUCYFER_PTP_CONFIG` | Statime config path. Default `/etc/lucyfer/statime.toml`, a PTPv1-follower config baked into the image (`docker/statime.toml`); mount your own over it to change interface, protocol version or domain. Startup fails fast if the file is missing. |
+
+Because the daemon runs in the *same container*, its usrvclock socket is just a path
+in that container's own filesystem — no shared volume, no `TMPDIR` juggling. The
+image default publishes at inferno's default path, so `dante.clock_path` can stay
+`null`. The entrypoint (`docker/entrypoint.sh`) supervises both processes: if either
+exits, the container exits, so a `restart:` policy recovers a dead clock instead of
+leaving lucyfer waiting for one forever.
+
+**Give the container a globally administered MAC** when you enable the daemon —
+`mac_address: 00:16:3e:…` in compose, say. Statime derives its PTP clock identity
+from the interface MAC and rejects locally administered addresses, which is what
+Docker assigns by default (`02:42:…`), so it panics on startup with `could not get
+clock identity`. Setting `identity` in the config does not avoid this: the fork
+evaluates the MAC fallback eagerly.
+
+The daemon's config disciplines a virtual clock based on `CLOCK_MONOTONIC_RAW`
+(`virtual-system-clock-base = "monotonic_raw"`), so it never writes `CLOCK_REALTIME`
+and does not fight the host's NTP daemon. It runs as a follower (`priority1 = 251`) —
+a real Dante device stays grandmaster. If lucyfer were the only Dante device on the
+segment, Statime would have to be master, which the fork supports for **PTPv2 only**
+and requires a Dante device with AES67 enabled to interoperate.
+
+Alternatives, if you would rather not run the bundled daemon: leave `LUCYFER_PTP`
+unset and either point `dante.clock_path` at a usrvclock socket published by a PTP
+daemon elsewhere, or set `dante.clock_path: /dev/ptp0` and pass the NIC's PHC
+(`devices: [/dev/ptp0]`) on a host where that clock is already disciplined.
+
+`deploy/` contains a worked production example (VLAN-isolated macvlan deployment).
+See also inferno's README "Clocking options".
 
 ## Caveats
 
