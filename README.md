@@ -183,6 +183,20 @@ docker compose up --build
 The dev `docker-compose.yml` includes a **fake clock** sidecar, host networking (for
 mDNS + Dante multicast), a state volume, `memlock` ulimit and `SYS_NICE`.
 
+### Prebuilt image
+
+`.github/workflows/docker.yml` builds the image on every push to `master` (and on
+version tags) and pushes it to GHCR, so a deployment does not have to compile Rust
+on the target host:
+
+```sh
+docker pull ghcr.io/alufers/lucyfer:latest
+```
+
+Tags: `latest` on `master`, `master`, `sha-<commit>`, and `X.Y.Z` / `X.Y` for `v*`
+tags. Pull requests build the image but do not push it. To use it, swap the
+`build:` block in a compose file for `image: ghcr.io/alufers/lucyfer:latest`.
+
 ## Production clocking
 
 The fake clock free-runs on `CLOCK_MONOTONIC` and **drifts against a real Dante
