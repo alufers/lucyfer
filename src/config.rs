@@ -14,8 +14,6 @@ pub struct Config {
     pub speakers: Vec<SpeakerConfig>,
     #[serde(default)]
     pub audio: AudioConfig,
-    #[serde(default)]
-    pub api: ApiConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -84,12 +82,6 @@ pub struct AudioConfig {
     pub lead_ms: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct ApiConfig {
-    #[serde(default = "default_api_bind")]
-    pub bind: String,
-}
-
 impl Default for SpotifyConfig {
     fn default() -> Self {
         Self {
@@ -116,14 +108,6 @@ impl Default for AudioConfig {
         Self {
             pacing_buffer_ms: default_pacing_buffer_ms(),
             lead_ms: default_lead_ms(),
-        }
-    }
-}
-
-impl Default for ApiConfig {
-    fn default() -> Self {
-        Self {
-            bind: default_api_bind(),
         }
     }
 }
@@ -205,9 +189,6 @@ fn default_pacing_buffer_ms() -> u32 {
 fn default_lead_ms() -> u32 {
     30
 }
-fn default_api_bind() -> String {
-    "0.0.0.0:8080".to_string()
-}
 
 #[cfg(test)]
 mod tests {
@@ -233,7 +214,6 @@ speakers:
         assert!(cfg.speakers[0].apply_volume);
         assert!(!cfg.speakers[1].apply_volume);
         assert_eq!(cfg.spotify.bitrate, 320);
-        assert_eq!(cfg.api.bind, "0.0.0.0:8080");
     }
 
     #[test]

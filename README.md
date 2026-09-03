@@ -4,9 +4,12 @@ A Rust microservice that exposes one or more **speakers** on your LAN — over *
 Connect** and **AirPlay** simultaneously — and transmits their audio over **Dante**
 (Audio over IP). Each speaker shows up in the Spotify app *and* in the AirPlay picker;
 its decoded audio is resampled and published as a stereo pair of TX channels on a
-single Dante device that other Dante gear can subscribe to. A REST + WebSocket API
-reports now-playing metadata / album art / volume and drives transport controls (play,
-pause, next, previous, seek, volume).
+single Dante device that other Dante gear can subscribe to. Per-speaker now-playing
+metadata / album art / volume is tracked in a shared state hub, together with the
+transport controls (play, pause, next, previous, seek, volume) each source exposes.
+
+> The control/reporting front end is currently being reworked: the previous REST +
+> WebSocket API has been removed and an MQTT client will take its place.
 
 Only one source drives a speaker at a time: whichever starts playing most recently
 takes it over and the other is paused (see [Source arbitration](#source-arbitration)).
@@ -39,7 +42,7 @@ media clock. See [Production clocking](#production-clocking).
                              SpeakerAudio arbiter ───┘
                              (one owner at a time)
                                     │
-                       events ──────┴──► StateHub ─► REST + WebSocket API
+                       events ──────┴──► StateHub ─► MQTT (planned)
 ```
 
 - librespot delivers interleaved **f64 stereo @ 44.1 kHz**; shairplay delivers **f32**
@@ -74,9 +77,8 @@ that decision, on a last-writer-wins basis:
   again.
 
 `SpeakerState.source` reports the current owner (`"spotify"`, `"airplay"` or `null`);
-`SpeakerState.sources` lists the ones this build is advertising on. API commands are
-routed to the owning source, so `POST /speakers/{id}/pause` pauses whatever is actually
-playing.
+`SpeakerState.sources` lists the ones this build is advertising on. Transport commands
+are routed to the owning source, so a `pause` pauses whatever is actually playing.
 
 ## Configuration
 
@@ -98,53 +100,20 @@ Copy `config.example.yaml` and edit it. Key fields:
 | `speakers[]` | `name` | Name shown in Spotify and AirPlay; Dante channels become `"<name> L"` / `"<name> R"`. |
 | `speakers[]` | `apply_volume` | `true` scales the Dante stream by the source's volume; `false` sends full-scale and only reports volume. |
 | `speakers[]` | `initial_volume` | 0.0–1.0 applied on Spotify session connect. |
-| `api` | `bind` | REST/WS listen address. |
 
 At least one source must be enabled; startup fails otherwise.
 
-## API
+## Speaker state
 
-REST, under `/api/v1`:
-
-| Method / path | Action |
-| --- | --- |
-| `GET /speakers` | List all speakers with state (positions extrapolated). |
-| `GET /speakers/{id}` | One speaker's state (404 if unknown). |
-| `POST /speakers/{id}/play` | Activate + play. |
-| `POST /speakers/{id}/pause` | Pause. |
-| `POST /speakers/{id}/playpause` | Toggle. |
-| `POST /speakers/{id}/next` \| `/previous` | Skip. |
-| `POST /speakers/{id}/seek` | Body `{"position_ms": 61000}`. |
-| `POST /speakers/{id}/volume` | Body `{"level": 0.55}` (0.0–1.0). |
-| `GET /speakers/{id}/artwork` | Cover art: the image bytes (AirPlay) or a 307 redirect to the CDN URL (Spotify). |
-| `GET /healthz` | Liveness. |
-
-`{id}` is the slug of the speaker name (e.g. `"Living Room"` → `living-room`).
-Commands go to whichever source currently owns the speaker. Responses: `204` ok,
-`409 {"error":"speaker_inactive"}` when no session has connected yet,
-`501 {"error":"unsupported_for_source"}` when the owning source cannot do it (AirPlay 1
-has no seek), `404` unknown speaker, `400` bad body.
-
-WebSocket, `GET /api/v1/ws`:
-
-```jsonc
-// server -> client
-{"type":"snapshot","speakers":[ /* SpeakerState */ ]}   // on connect
-{"type":"speaker_update","speaker": { /* SpeakerState */ }}  // on every change
-{"type":"ack","speaker_id":"living-room","action":"play"}
-{"type":"error","message":"..."}
-// client -> server
-{"type":"command","speaker_id":"living-room","action":"play|pause|playpause|next|previous"}
-{"type":"command","speaker_id":"living-room","action":"seek","position_ms":61000}
-{"type":"command","speaker_id":"living-room","action":"volume","level":0.55}
-```
-
-`SpeakerState` carries: `id`, `name`, `apply_volume`, `sources`
+Each speaker's state, held in the `StateHub` (`src/state.rs`) and broadcast on every
+change, carries: `id` (the slug of the speaker name, e.g. `"Living Room"` →
+`living-room`), `name`, `apply_volume`, `sources`
 (`["spotify","airplay"]` — which sources this speaker is advertised on), `source`
 (which one currently drives the Dante channels, or `null`), `playback`
 (`inactive|stopped|playing|paused|loading`), `active_user`, `volume` (0–1), `track`
 (`uri`, `name`, `artists`, `album`, `duration_ms`, `art_url`), `position_ms` +
-`position_captured_at_ms` (extrapolate while playing), `shuffle`, `repeat`.
+`position_captured_at_ms` (extrapolate while playing), `shuffle`, `repeat`. Album art
+that a source pushes as raw bytes (AirPlay) is kept in a side table on the hub.
 
 ## Running
 
@@ -253,7 +222,7 @@ See also inferno's README "Clocking options".
   silence on underrun / dropping frames on overflow, so expect an occasional glitch on
   long streams. Raise `audio.pacing_buffer_ms` if you see repeated overflow warnings.
 - **`seek` is unsupported while a speaker is AirPlay-owned** (DACP has no seek verb) —
-  the API returns `501`.
+  the command is rejected as unsupported.
 - **Discovery binds all interfaces.** librespot's zeroconf credential HTTP server
   always listens on `0.0.0.0`/`[::]`; only the mDNS *advertisement* is
   interface-scoped (`spotify.interface_ip`, libmdns backend). On the AirPlay side it is

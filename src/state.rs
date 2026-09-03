@@ -1,5 +1,5 @@
-//! Shared per-speaker playback state: a snapshot map (for REST reads) plus a
-//! broadcast channel of updates (for WebSocket streaming).
+//! Shared per-speaker playback state: a snapshot map of the latest state plus a
+//! broadcast channel of updates, both consumed by the control layer.
 //!
 //! Artwork is kept in a side table rather than on `SpeakerState`: Spotify supplies a
 //! CDN URL, but AirPlay pushes raw JPEG/PNG bytes that we have to serve ourselves.
@@ -33,6 +33,8 @@ pub struct TrackInfo {
 }
 
 /// Album art bytes pushed by a source that has no public URL for them (AirPlay).
+// Read back by the control layer; kept for the upcoming MQTT client.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Artwork {
     pub bytes: Vec<u8>,
@@ -80,6 +82,7 @@ impl SpeakerState {
     }
 
     /// A copy with `position_ms` advanced to the present if currently playing.
+    #[allow(dead_code)]
     pub fn extrapolated(&self) -> Self {
         let mut s = self.clone();
         if s.playback == Playback::Playing {
@@ -108,6 +111,8 @@ pub struct StateHub {
     events: broadcast::Sender<StateEvent>,
 }
 
+// The read side of the hub (`subscribe`, `get`, `get_artwork`, `all`) has no consumer
+// until the MQTT client lands; the write side is driven by the sources.
 impl StateHub {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(256);
@@ -128,6 +133,7 @@ impl StateHub {
             .insert(state.id.clone(), state);
     }
 
+    #[allow(dead_code)]
     pub fn subscribe(&self) -> broadcast::Receiver<StateEvent> {
         self.events.subscribe()
     }
@@ -145,6 +151,7 @@ impl StateHub {
         let _ = self.events.send(StateEvent::SpeakerUpdate { speaker: updated });
     }
 
+    #[allow(dead_code)]
     pub fn get(&self, id: &str) -> Option<SpeakerState> {
         self.snapshot.read().unwrap().get(id).map(|s| s.extrapolated())
     }
@@ -157,6 +164,7 @@ impl StateHub {
             .insert(id.to_string(), artwork);
     }
 
+    #[allow(dead_code)]
     pub fn get_artwork(&self, id: &str) -> Option<Artwork> {
         self.artwork.read().unwrap().get(id).cloned()
     }
@@ -166,6 +174,7 @@ impl StateHub {
     }
 
     /// All speakers in registration order, with positions extrapolated.
+    #[allow(dead_code)]
     pub fn all(&self) -> Vec<SpeakerState> {
         let map = self.snapshot.read().unwrap();
         self.order

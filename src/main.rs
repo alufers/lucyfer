@@ -1,7 +1,6 @@
 //! lucyfer — expose Spotify Connect and AirPlay speakers, transmitting their audio
 //! over Dante.
 
-mod api;
 mod audio;
 mod config;
 mod dante;
@@ -93,8 +92,8 @@ async fn main() -> Result<()> {
     }
 
     // Start the Dante device + ring writer. Startup does NOT block on the media clock:
-    // discovery and the API come up immediately; only audio TX is gated until a media
-    // clock (PTP/usrvclock) becomes available.
+    // discovery comes up immediately; only audio TX is gated until a media clock
+    // (PTP/usrvclock) becomes available.
     let dante = dante::DanteOutput::start(&cfg.dante, &speaker_names, consumers, lead_samples)
         .await
         .context("starting Dante output")?;
@@ -137,18 +136,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Serve the API.
-    let app = api::router(hub, registry);
-    let listener = tokio::net::TcpListener::bind(&cfg.api.bind)
-        .await
-        .with_context(|| format!("binding API to {}", cfg.api.bind))?;
-    tracing::info!("API listening on http://{}", cfg.api.bind);
-
-    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
-
-    if let Err(e) = server.await {
-        tracing::error!("API server error: {e:#}");
-    }
+    // Run until asked to stop. `hub` and `registry` are the handles a control layer
+    // (MQTT, planned) will take.
+    let _ = (&hub, &registry);
+    shutdown_signal().await;
 
     tracing::info!("shutting down");
     for t in source_tasks {

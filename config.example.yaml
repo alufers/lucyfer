@@ -53,7 +53,7 @@ speakers:
     apply_volume: true # scale the Dante stream by the source's volume
     initial_volume: 0.6 # 0.0 - 1.0, applied when a Spotify session connects
   - name: "Kitchen"
-    apply_volume: false # send full-scale audio to Dante; report volume only via the API
+    apply_volume: false # send full-scale audio to Dante; report volume only
 
 audio:
   # Depth of the per-speaker pacing queue in milliseconds. Larger = more robust
@@ -62,6 +62,3 @@ audio:
   pacing_buffer_ms: 150
   # How far ahead of the media clock the ring writer fills, in milliseconds.
   lead_ms: 30
-
-api:
-  bind: "0.0.0.0:8080"

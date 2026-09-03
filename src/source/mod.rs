@@ -58,7 +58,7 @@ impl SourceKind {
     }
 }
 
-/// Outcome of a transport command issued through the API.
+/// Outcome of a transport command issued by the control layer.
 pub enum CommandResult {
     Ok,
     /// No session from any source has connected to this speaker yet.
@@ -68,10 +68,13 @@ pub enum CommandResult {
     Failed(String),
 }
 
-/// One source's control surface for a speaker, as used by the REST/WS API.
+/// One source's control surface for a speaker, as used by the control layer.
 ///
 /// Implemented by `spotify::SpotifyControl` (over `Spirc`) and
 /// `airplay::AirPlayControl` (over shairplay's DACP `RemoteControl`).
+// Only `yield_now` has a caller today; the transport methods are the command surface
+// kept for the upcoming MQTT client.
+#[allow(dead_code)]
 pub trait SourceControl: Send + Sync {
     fn kind(&self) -> SourceKind;
     fn play(&self) -> CommandResult;
@@ -84,6 +87,35 @@ pub trait SourceControl: Send + Sync {
     fn set_volume(&self, level: f32) -> CommandResult;
     /// Another source has taken the speaker: stop playing. Best effort, must not block.
     fn yield_now(&self);
+}
+
+/// Apply a named action to whichever source currently drives a speaker.
+/// `Err` means the request itself was malformed.
+// Command surface, kept for the upcoming MQTT client.
+#[allow(dead_code)]
+pub fn dispatch(
+    control: &dyn SourceControl,
+    action: &str,
+    position_ms: Option<u32>,
+    level: Option<f32>,
+) -> Result<CommandResult, String> {
+    let result = match action {
+        "play" => control.play(),
+        "pause" => control.pause(),
+        "playpause" => control.play_pause(),
+        "next" => control.next(),
+        "previous" => control.previous(),
+        "seek" => {
+            let pos = position_ms.ok_or_else(|| "seek requires position_ms".to_string())?;
+            control.seek(pos)
+        }
+        "volume" => {
+            let level = level.ok_or_else(|| "volume requires level".to_string())?;
+            control.set_volume(level)
+        }
+        other => return Err(format!("unknown action '{other}'")),
+    };
+    Ok(result)
 }
 
 /// Result of handing frames to a speaker's queue.
@@ -148,9 +180,11 @@ impl SpeakerAudio {
         self.controls.lock().unwrap().get(&kind).cloned()
     }
 
-    /// The control an API command should be routed to: the owning source if any,
+    /// The control a transport command should be routed to: the owning source if any,
     /// otherwise the only registered one, otherwise Spotify (whose `play` can activate
     /// an idle Connect session, which AirPlay has no equivalent for).
+    // Command surface, kept for the upcoming MQTT client.
+    #[allow(dead_code)]
     pub fn command_target(&self) -> Option<Arc<dyn SourceControl>> {
         if let Some(owner) = self.owner()
             && let Some(ctl) = self.control(owner)
@@ -293,7 +327,7 @@ impl SpeakerAudio {
     }
 }
 
-/// Registry of every speaker's audio path, keyed by id, for the API layer.
+/// Registry of every speaker's audio path, keyed by id, for the control layer.
 #[derive(Clone, Default)]
 pub struct SpeakerRegistry {
     map: Arc<Mutex<HashMap<String, Arc<SpeakerAudio>>>>,
@@ -308,6 +342,8 @@ impl SpeakerRegistry {
         self.map.lock().unwrap().insert(audio.id.clone(), audio);
     }
 
+    // Command surface, kept for the upcoming MQTT client.
+    #[allow(dead_code)]
     pub fn get(&self, id: &str) -> Option<Arc<SpeakerAudio>> {
         self.map.lock().unwrap().get(id).cloned()
     }

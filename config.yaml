@@ -39,6 +39,3 @@ speakers:
 audio:
   pacing_buffer_ms: 150
   lead_ms: 30
-
-api:
-  bind: "0.0.0.0:8080"

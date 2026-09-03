@@ -51,13 +51,13 @@ struct AirPlayState {
     /// `now_ms()` of the last audio packet, for the paused heuristic.
     last_frame_at: AtomicU64,
     /// Whether `Playback::Playing` has already been published. `hub.update` broadcasts
-    /// to every WebSocket client, so the audio hot path must only touch it on a
+    /// to every state subscriber, so the audio hot path must only touch it on a
     /// transition, not once per packet.
     reported_playing: AtomicBool,
     /// Open RTSP connections. iOS opens several in parallel and drops the losers, so
     /// state is only torn down when the last one closes.
     connections: AtomicUsize,
-    /// Bumped on every new cover so the artwork URL busts client caches.
+    /// Bumped on every new cover, so a control layer can tell when it changed.
     art_version: AtomicU64,
     remote: Mutex<Option<Arc<dyn RemoteControl>>>,
     /// Frames dropped since the last warning, for rate-limited logging.
@@ -226,14 +226,15 @@ impl AudioHandler for AirPlayHandler {
     }
 
     fn on_metadata(&self, metadata: &TrackMetadata) {
-        let art_url = artwork_url(&self.state.id, self.state.art_version.load(Ordering::Relaxed));
         let info = TrackInfo {
             uri: format!("airplay:{}", self.state.id),
             name: metadata.title.clone().unwrap_or_else(|| "Unknown".into()),
             artists: metadata.artist.clone().into_iter().collect(),
             album: metadata.album.clone(),
             duration_ms: metadata.duration_ms.unwrap_or(0),
-            art_url,
+            // AirPlay pushes cover bytes, not a URL: they go to the hub's artwork
+            // table, and `art_version` says which revision is current.
+            art_url: None,
         };
         self.state.update_if_owner(|s| s.track = Some(info));
     }
@@ -242,7 +243,7 @@ impl AudioHandler for AirPlayHandler {
         let Some(content_type) = sniff_image(coverart) else {
             return;
         };
-        let version = self.state.art_version.fetch_add(1, Ordering::Relaxed) + 1;
+        self.state.art_version.fetch_add(1, Ordering::Relaxed);
         self.state.hub.set_artwork(
             &self.state.id,
             Artwork {
@@ -250,12 +251,6 @@ impl AudioHandler for AirPlayHandler {
                 content_type,
             },
         );
-        let url = artwork_url(&self.state.id, version);
-        self.state.update_if_owner(|s| {
-            if let Some(track) = s.track.as_mut() {
-                track.art_url = url;
-            }
-        });
     }
 
     fn on_progress(&self, start: u32, current: u32, end: u32) {
@@ -486,10 +481,6 @@ fn hwaddr(name: &str) -> Vec<u8> {
     addr
 }
 
-pub fn artwork_url(id: &str, version: u64) -> Option<String> {
-    (version > 0).then(|| format!("/api/v1/speakers/{id}/artwork?v={version}"))
-}
-
 fn rtp_to_ms(ticks: u32) -> u32 {
     (ticks as f64 * 1000.0 / RTP_RATE) as u32
 }
@@ -565,12 +556,4 @@ mod tests {
         assert_eq!(sniff_image(b"not an image"), None);
     }
 
-    #[test]
-    fn artwork_url_only_once_a_cover_arrived() {
-        assert_eq!(artwork_url("kitchen", 0), None);
-        assert_eq!(
-            artwork_url("kitchen", 3).as_deref(),
-            Some("/api/v1/speakers/kitchen/artwork?v=3")
-        );
-    }
 }
