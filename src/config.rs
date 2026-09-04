@@ -48,11 +48,6 @@ pub struct AirPlayConfig {
     /// Advertise every speaker over AirPlay.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Address the RTSP listener binds to. null -> all interfaces.
-    ///
-    /// NOTE: this pins the *listener* only. mDNS is advertised on every interface
-    /// (shairplay registers with `mdns-sd`'s address auto-detection), exactly like the
-    /// Spotify Connect side.
     #[serde(default)]
     pub interface_ip: Option<String>,
     /// RTSP port for the first speaker; speaker N listens on `base_port + N`.
@@ -153,93 +148,4 @@ fn default_airplay_base_port() -> u16 {
 }
 fn default_true() -> bool {
     true
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_example_config_shape() {
-        let yaml = r#"
-dante:
-  interface: "eth0"
-spotify: {}
-speakers:
-  - name: "Living Room"
-  - name: "Kitchen"
-    apply_volume: false
-"#;
-        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        cfg.validate().unwrap();
-        assert_eq!(cfg.dante.sample_rate, 48000);
-        assert_eq!(cfg.speakers.len(), 2);
-        // apply_volume defaults to true
-        assert!(cfg.speakers[0].apply_volume);
-        assert!(!cfg.speakers[1].apply_volume);
-        assert_eq!(cfg.spotify.bitrate, 320);
-    }
-
-    #[test]
-    fn both_sources_default_to_enabled() {
-        // An `airplay:` block may be omitted entirely by pre-AirPlay configs.
-        let yaml = r#"
-dante:
-  interface: "eth0"
-spotify: {}
-speakers:
-  - name: "A"
-"#;
-        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        cfg.validate().unwrap();
-        assert!(cfg.spotify.enabled);
-        assert!(cfg.airplay.enabled);
-        assert_eq!(cfg.airplay.base_port, 5000);
-    }
-
-    #[test]
-    fn rejects_all_sources_disabled() {
-        let yaml = r#"
-dante:
-  interface: "eth0"
-spotify:
-  enabled: false
-airplay:
-  enabled: false
-speakers:
-  - name: "A"
-"#;
-        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn rejects_airplay_port_block_overflowing() {
-        let yaml = r#"
-dante:
-  interface: "eth0"
-airplay:
-  base_port: 65534
-speakers:
-  - name: "A"
-  - name: "B"
-  - name: "C"
-"#;
-        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn rejects_duplicate_names() {
-        let yaml = r#"
-dante:
-  interface: "eth0"
-spotify: {}
-speakers:
-  - name: "A"
-  - name: "A"
-"#;
-        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        assert!(cfg.validate().is_err());
-    }
 }

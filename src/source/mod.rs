@@ -1,17 +1,3 @@
-//! Audio sources and the per-speaker arbitration between them.
-//!
-//! A speaker is a single stereo pair of Dante TX channels that is advertised
-//! simultaneously by every enabled source (Spotify Connect and AirPlay). Only one
-//! source may drive those channels at a time, so each speaker owns a [`SpeakerAudio`]:
-//! the Dante sink plus a lock-free "who owns this speaker" flag and the registered
-//! per-source control surfaces.
-//!
-//! Arbitration is **last writer wins**: whichever source starts playing most recently
-//! claims the speaker, and the displaced source is gracefully told to stop
-//! ([`SourceControl::yield_now`] — `spirc.pause()` for Spotify, a DACP pause for
-//! AirPlay) and gated off the sink. Both network sessions stay alive, so switching
-//! back is immediate.
-
 pub mod airplay;
 pub mod spotify;
 
@@ -68,12 +54,6 @@ pub enum CommandResult {
     Failed(String),
 }
 
-/// One source's control surface for a speaker, as used by the control layer.
-///
-/// Implemented by `spotify::SpotifyControl` (over `Spirc`) and
-/// `airplay::AirPlayControl` (over shairplay's DACP `RemoteControl`).
-// Only `yield_now` has a caller today; the transport methods are the command surface
-// kept for the upcoming MQTT client.
 #[allow(dead_code)]
 pub trait SourceControl: Send + Sync {
     fn kind(&self) -> SourceKind;
@@ -89,9 +69,6 @@ pub trait SourceControl: Send + Sync {
     fn yield_now(&self);
 }
 
-/// Apply a named action to whichever source currently drives a speaker.
-/// `Err` means the request itself was malformed.
-// Command surface, kept for the upcoming MQTT client.
 #[allow(dead_code)]
 pub fn dispatch(
     control: &dyn SourceControl,
@@ -166,10 +143,6 @@ impl SpeakerAudio {
         self.controls.lock().unwrap().get(&kind).cloned()
     }
 
-    /// The control a transport command should be routed to: the owning source if any,
-    /// otherwise the only registered one, otherwise Spotify (whose `play` can activate
-    /// an idle Connect session, which AirPlay has no equivalent for).
-    // Command surface, kept for the upcoming MQTT client.
     #[allow(dead_code)]
     pub fn command_target(&self) -> Option<Arc<dyn SourceControl>> {
         if let Some(owner) = self.owner()
@@ -197,10 +170,6 @@ impl SpeakerAudio {
         self.owner.load(Ordering::Acquire) == kind.tag()
     }
 
-    /// Take the speaker for `kind`, gracefully stopping whoever had it.
-    ///
-    /// Idempotent: re-claiming for the current owner does nothing, so sources can call
-    /// this on every "started playing" event.
     pub fn claim(&self, kind: SourceKind) {
         let previous = self.owner.swap(kind.tag(), Ordering::AcqRel);
         if previous == kind.tag() {
@@ -247,9 +216,6 @@ impl SpeakerAudio {
 
     // --- audio ---
 
-    /// Push all frames, parking while the sink is already a full buffer ahead of the
-    /// media clock. Blocking here is what paces a decode-ahead source (Spotify); it must
-    /// only be called from a dedicated thread.
     pub fn push_blocking(&self, kind: SourceKind, mut frames: &[Frame]) -> PushResult {
         while !frames.is_empty() {
             if !self.is_owner(kind) {
@@ -267,15 +233,6 @@ impl SpeakerAudio {
         PushResult::Written
     }
 
-    /// Push what currently fits and drop the rest, never blocking.
-    ///
-    /// Used by real-time sources (AirPlay), whose callbacks run on tokio tasks — parking
-    /// there would stall a runtime worker — and which cannot be back-pressured anyway.
-    /// The sink gives them extra slack above the paced ceiling and re-anchors when they
-    /// fall behind, so a free-running sender clock drifts against a cushion instead of
-    /// underrunning continuously.
-    ///
-    /// Returns the number of frames dropped alongside the result.
     pub fn push_realtime(&self, kind: SourceKind, frames: &[Frame]) -> (PushResult, usize) {
         if !self.is_owner(kind) {
             return (PushResult::Preempted, frames.len());
@@ -284,7 +241,6 @@ impl SpeakerAudio {
         (PushResult::Written, frames.len() - written)
     }
 
-    /// Drop everything written but not yet transmitted (AirPlay flush / seek).
     pub fn flush(&self) {
         self.sink.reset();
     }

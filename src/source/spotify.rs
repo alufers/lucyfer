@@ -1,7 +1,3 @@
-//! Spotify Connect source: a per-speaker zeroconf discovery loop that, on each new set
-//! of credentials, tears down any prior session and builds a fresh
-//! Session/Player/Spirc wired to this speaker's Dante pacing queue.
-
 use super::{CommandResult, PushResult, SourceControl, SourceKind, SpeakerAudio, speaker_id};
 use crate::dante::Frame;
 use crate::resampler::SpeakerResampler;
@@ -28,7 +24,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
-/// librespot decodes at a fixed 44.1 kHz.
 const SPOTIFY_RATE: u32 = 44_100;
 
 // --- control surface ---
@@ -88,8 +83,6 @@ impl SourceControl for SpotifyControl {
         self.with_spirc(|s| s.set_volume(v))
     }
 
-    /// Another source took the speaker: pause, keeping the Connect session alive so the
-    /// user can hand playback straight back.
     fn yield_now(&self) {
         if let CommandResult::Failed(e) = self.pause() {
             tracing::warn!("spotify yield_now: pause failed: {e}");
@@ -97,10 +90,6 @@ impl SourceControl for SpotifyControl {
     }
 }
 
-// --- audio sink ---
-
-/// A librespot audio `Sink` that resamples the decoded stream and writes it into the
-/// speaker's Dante rings. Blocking on a full buffer is what paces librespot.
 struct DanteSink {
     resampler: SpeakerResampler,
     audio: Arc<SpeakerAudio>,
@@ -139,9 +128,6 @@ impl Sink for DanteSink {
         self.scratch.clear();
         self.resampler.process(samples, &mut self.scratch);
 
-        // `Preempted` means another source owns the speaker: swallow the audio (Dante
-        // must not see it) but keep the session alive, so a later `claim` resumes
-        // seamlessly.
         let _: PushResult = self.audio.push_blocking(SourceKind::Spotify, &self.scratch);
         Ok(())
     }
