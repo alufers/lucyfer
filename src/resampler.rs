@@ -45,7 +45,10 @@ impl SpeakerResampler {
         let out_max = resampler.output_frames_max();
         Ok(SpeakerResampler::Fft(FftState {
             resampler,
-            in_buf: [Vec::with_capacity(CHUNK_IN * 2), Vec::with_capacity(CHUNK_IN * 2)],
+            in_buf: [
+                Vec::with_capacity(CHUNK_IN * 2),
+                Vec::with_capacity(CHUNK_IN * 2),
+            ],
             out_buf: [vec![0.0; out_max], vec![0.0; out_max]],
         }))
     }
@@ -66,9 +69,12 @@ impl SpeakerResampler {
                     out.push([f64_to_sample(pair[0]), f64_to_sample(pair[1])]);
                 }
             }
-            SpeakerResampler::Fft(s) => {
-                s.process(interleaved.chunks_exact(2).map(|p| (p[0] as f32, p[1] as f32)), out)
-            }
+            SpeakerResampler::Fft(s) => s.process(
+                interleaved
+                    .chunks_exact(2)
+                    .map(|p| (p[0] as f32, p[1] as f32)),
+                out,
+            ),
         }
     }
 
@@ -189,7 +195,11 @@ mod tests {
             expected
         );
         // Peak of a 0.5-amplitude sine should be near 0.5 * i32::MAX.
-        let peak = out.iter().map(|f| f[0].unsigned_abs() as u64).max().unwrap();
+        let peak = out
+            .iter()
+            .map(|f| f[0].unsigned_abs() as u64)
+            .max()
+            .unwrap();
         let target = (0.5 * Sample::MAX as f64) as u64;
         assert!(
             peak > target * 8 / 10 && peak < target * 12 / 10,

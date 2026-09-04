@@ -1,7 +1,7 @@
 use super::{CommandResult, PushResult, SourceControl, SourceKind, SpeakerAudio, speaker_id};
+use crate::config::{SpeakerConfig, SpotifyConfig};
 use crate::dante::Frame;
 use crate::resampler::SpeakerResampler;
-use crate::config::{SpeakerConfig, SpotifyConfig};
 use crate::state::{Playback, StateHub, TrackInfo, now_ms};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -15,7 +15,7 @@ use librespot_playback::config::{Bitrate, PlayerConfig};
 use librespot_playback::convert::Converter;
 use librespot_playback::decoder::AudioPacket;
 use librespot_playback::mixer::softmixer::SoftMixer;
-use librespot_playback::mixer::{Mixer, MixerConfig, NoOpVolume, VolumeGetter};
+use librespot_playback::mixer::{Mixer, MixerConfig, NoOpVolume};
 use librespot_playback::player::{Player, PlayerEvent, PlayerEventChannel};
 use sha1::{Digest, Sha1};
 use std::net::IpAddr;
@@ -26,9 +26,6 @@ use tokio::task::JoinHandle;
 
 const SPOTIFY_RATE: u32 = 44_100;
 
-// --- control surface ---
-
-/// The API's handle on a speaker's current Spirc (if a session is connected).
 pub struct SpotifyControl {
     spirc: Arc<Mutex<Option<Spirc>>>,
 }
@@ -133,14 +130,10 @@ impl Sink for DanteSink {
     }
 }
 
-// --- discovery / session loop ---
-
 fn device_id(name: &str) -> String {
     hex::encode(Sha1::digest(name.as_bytes()))
 }
 
-/// Run the discovery/session loop for one speaker. Returns only if discovery terminates
-/// (fatal mDNS error).
 pub async fn run_speaker(
     speaker: SpeakerConfig,
     spotify: SpotifyConfig,
@@ -176,9 +169,6 @@ pub async fn run_speaker(
         device_id
     );
 
-    // The active Spirc lives in `spirc_slot` (Spirc is not Clone) so the registered
-    // SpotifyControl keeps working across session restarts; we only track its background
-    // task here so we can abort it on the next credential.
     let spirc_slot: Arc<Mutex<Option<Spirc>>> = Arc::new(Mutex::new(None));
     audio.register_control(Arc::new(SpotifyControl::new(spirc_slot.clone())));
     let mut active_task: Option<JoinHandle<()>> = None;
@@ -243,13 +233,11 @@ async fn start_session(
 
     let session = Session::new(session_config.clone(), cache);
 
+    // The mixer only tracks and reports volume for Spirc; `NoOpVolume` keeps the player
+    // from attenuating the samples. Volume lives in the amplifier (relayed over MQTT), so
+    // Dante always carries the full-scale signal.
     let mixer: Arc<dyn Mixer> =
         Arc::new(SoftMixer::open(MixerConfig::default()).context("opening mixer")?);
-    let volume_getter: Box<dyn VolumeGetter + Send> = if speaker.apply_volume {
-        mixer.get_soft_volume()
-    } else {
-        Box::new(NoOpVolume)
-    };
 
     let player_config = PlayerConfig {
         bitrate: bitrate_from(spotify.bitrate),
@@ -257,20 +245,26 @@ async fn start_session(
         ..Default::default()
     };
 
+    // Read before `audio` is moved into the event pump below.
+    let desired_volume = audio.desired_volume();
     let sink_audio = audio.clone();
-    let player = Player::new(player_config, session.clone(), volume_getter, move || {
-        Box::new(DanteSink::new(dante_rate, sink_audio))
-    });
+    let player = Player::new(
+        player_config,
+        session.clone(),
+        Box::new(NoOpVolume),
+        move || Box::new(DanteSink::new(dante_rate, sink_audio)),
+    );
 
     tokio::spawn(pump_events(player.get_player_event_channel(), hub, audio));
 
+    // Come up already at the amplifier's level when it is known, so Spirc never
+    // announces a volume of its own and yanks the amplifier with it.
     let connect_config = ConnectConfig {
         name: speaker.name.clone(),
         device_type: DeviceType::Speaker,
-        initial_volume: speaker
-            .initial_volume
-            .map(|v| (v.clamp(0.0, 1.0) * u16::MAX as f32) as u16)
-            .unwrap_or(u16::MAX / 2),
+        initial_volume: desired_volume
+            .map(|v| (v * u16::MAX as f32) as u16)
+            .unwrap_or(ConnectConfig::default().initial_volume),
         ..Default::default()
     };
 
@@ -282,14 +276,6 @@ async fn start_session(
     Ok((spirc, task))
 }
 
-// --- player events -> state hub ---
-
-/// Translate librespot `PlayerEvent`s into `SpeakerState` updates, claiming and
-/// releasing the speaker as playback starts and stops.
-///
-/// Every now-playing update is gated on Spotify still owning the speaker: a preempted
-/// session keeps running (so it can be handed control back instantly) and must not
-/// overwrite the AirPlay-owned view of the speaker in the meantime.
 async fn pump_events(mut rx: PlayerEventChannel, hub: StateHub, audio: Arc<SpeakerAudio>) {
     let id = audio.id.clone();
     let owns = || audio.is_owner(SourceKind::Spotify);
@@ -346,9 +332,6 @@ async fn pump_events(mut rx: PlayerEventChannel, hub: StateHub, audio: Arc<Speak
                     });
                 }
             }
-            // Shuffle and repeat are Spotify-only concepts, so they track the session
-            // regardless of who owns the speaker. Volume is a shared field and must not
-            // clobber the AirPlay-reported one.
             PlayerEvent::VolumeChanged { volume } => {
                 if owns() {
                     hub.update(&id, |s| s.volume = volume as f32 / u16::MAX as f32);

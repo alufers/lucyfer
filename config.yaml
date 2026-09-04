@@ -24,12 +24,15 @@ airplay:
   interface_ip: null # <-- optionally pin the RTSP listener to one IP
   base_port: 5000 # speaker N listens on base_port + N
 
+# mqtt:
+#   broker: "10.165.1.1:1883"
+#   username: null
+#   password: null
+#   prefix: "lucyfer"
+
 speakers:
   - name: "Elelab"
-    apply_volume: false
-    initial_volume: 0.6
   - name: "Audytorium"
-    apply_volume: false
   - name: "Arts and Crafts"
   - name: "Kuźnia"
   - name: "CNC"

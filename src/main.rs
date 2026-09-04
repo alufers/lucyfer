@@ -3,6 +3,7 @@
 
 mod config;
 mod dante;
+mod mqtt;
 mod resampler;
 mod source;
 mod state;
@@ -74,7 +75,6 @@ async fn main() -> Result<()> {
         hub.register(SpeakerState::new(
             id.clone(),
             sp.name.clone(),
-            sp.apply_volume,
             sources.clone(),
         ));
         let audio = Arc::new(SpeakerAudio::new(id, sp.name.clone(), hub.clone(), sink));
@@ -86,12 +86,8 @@ async fn main() -> Result<()> {
     let mut source_tasks = Vec::new();
     for (index, (sp, audio)) in cfg.speakers.iter().zip(speaker_audio.iter()).enumerate() {
         if cfg.spotify.enabled {
-            let (sp, spotify, audio, hub) = (
-                sp.clone(),
-                cfg.spotify.clone(),
-                audio.clone(),
-                hub.clone(),
-            );
+            let (sp, spotify, audio, hub) =
+                (sp.clone(), cfg.spotify.clone(), audio.clone(), hub.clone());
             let rate = cfg.dante.sample_rate;
             source_tasks.push(tokio::spawn(async move {
                 let name = sp.name.clone();
@@ -101,12 +97,8 @@ async fn main() -> Result<()> {
             }));
         }
         if cfg.airplay.enabled {
-            let (sp, airplay, audio, hub) = (
-                sp.clone(),
-                cfg.airplay.clone(),
-                audio.clone(),
-                hub.clone(),
-            );
+            let (sp, airplay, audio, hub) =
+                (sp.clone(), cfg.airplay.clone(), audio.clone(), hub.clone());
             let rate = cfg.dante.sample_rate;
             let port = cfg.airplay.base_port + index as u16;
             source_tasks.push(tokio::spawn(async move {
@@ -120,12 +112,29 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Run until asked to stop. `hub` and `registry` are the handles a control layer
-    // (MQTT, planned) will take.
-    let _ = (&hub, &registry);
+    // The MQTT control surface, when configured. It owns the read side of the hub and
+    // the command side of the registry.
+    let mqtt_task = match &cfg.mqtt {
+        Some(m) if m.enabled => {
+            let (cfg, hub, registry) = (cfg.clone(), hub.clone(), registry.clone());
+            Some(tokio::spawn(async move {
+                if let Err(e) = mqtt::run(&cfg, hub, registry).await {
+                    tracing::error!("MQTT client ended with error: {e:#}");
+                }
+            }))
+        }
+        _ => {
+            tracing::info!("MQTT not configured; running without a control surface");
+            None
+        }
+    };
+
     shutdown_signal().await;
 
     tracing::info!("shutting down");
+    if let Some(t) = mqtt_task {
+        t.abort();
+    }
     for t in source_tasks {
         t.abort();
     }

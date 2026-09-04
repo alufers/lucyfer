@@ -5,7 +5,7 @@ use crate::dante::{Frame, SpeakerSink};
 use crate::state::StateHub;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -54,7 +54,6 @@ pub enum CommandResult {
     Failed(String),
 }
 
-#[allow(dead_code)]
 pub trait SourceControl: Send + Sync {
     fn kind(&self) -> SourceKind;
     fn play(&self) -> CommandResult;
@@ -112,6 +111,11 @@ pub struct SpeakerAudio {
     sink: Arc<SpeakerSink>,
     owner: AtomicU8,
     controls: Mutex<HashMap<SourceKind, Arc<dyn SourceControl>>>,
+    /// Volume the amplifier is actually at, as f32 bits (0.0-1.0). NaN means "not known
+    /// yet" — nothing has arrived on the speaker's `volume_topic`. Sources are pulled to
+    /// this value rather than being allowed to impose one, so connecting never makes a
+    /// loud noise.
+    desired_volume: AtomicU32,
 }
 
 impl SpeakerAudio {
@@ -123,12 +127,18 @@ impl SpeakerAudio {
             sink,
             owner: AtomicU8::new(OWNER_NONE),
             controls: Mutex::new(HashMap::new()),
+            desired_volume: AtomicU32::new(f32::NAN.to_bits()),
         }
     }
 
     // --- control registration ---
 
     pub fn register_control(&self, control: Arc<dyn SourceControl>) {
+        // Pull the newcomer to the amplifier's level immediately; otherwise its own idea
+        // of the volume would be reported outwards and yank the amplifier with it.
+        if let Some(level) = self.desired_volume() {
+            control.set_volume(level);
+        }
         self.controls
             .lock()
             .unwrap()
@@ -158,6 +168,33 @@ impl SpeakerAudio {
             .get(&SourceKind::Spotify)
             .or_else(|| controls.get(&SourceKind::Airplay))
             .cloned()
+    }
+
+    // --- volume ---
+
+    /// The amplifier's current volume (0.0-1.0), or `None` if it has not reported one.
+    pub fn desired_volume(&self) -> Option<f32> {
+        let level = f32::from_bits(self.desired_volume.load(Ordering::Acquire));
+        (!level.is_nan()).then_some(level)
+    }
+
+    /// Record the amplifier's volume and mirror it into *every* registered source, so
+    /// both the Spotify and AirPlay sliders agree with what is actually audible.
+    pub fn set_desired_volume(&self, level: f32) {
+        let level = level.clamp(0.0, 1.0);
+        self.desired_volume
+            .store(level.to_bits(), Ordering::Release);
+        let controls: Vec<Arc<dyn SourceControl>> =
+            self.controls.lock().unwrap().values().cloned().collect();
+        for control in controls {
+            if let CommandResult::Failed(e) = control.set_volume(level) {
+                tracing::warn!(
+                    "speaker '{}': {} rejected volume {level:.3}: {e}",
+                    self.name,
+                    control.kind().label()
+                );
+            }
+        }
     }
 
     // --- ownership ---
@@ -261,8 +298,6 @@ impl SpeakerRegistry {
         self.map.lock().unwrap().insert(audio.id.clone(), audio);
     }
 
-    // Command surface, kept for the upcoming MQTT client.
-    #[allow(dead_code)]
     pub fn get(&self, id: &str) -> Option<Arc<SpeakerAudio>> {
         self.map.lock().unwrap().get(id).cloned()
     }
@@ -329,7 +364,6 @@ mod tests {
         hub.register(crate::state::SpeakerState::new(
             "kitchen".into(),
             "Kitchen".into(),
-            true,
             vec![SourceKind::Spotify, SourceKind::Airplay],
         ));
         Arc::new(SpeakerAudio::new(

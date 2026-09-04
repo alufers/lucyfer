@@ -45,9 +45,43 @@ airplay:
   # speakers below that is 5000 and 5001.
   base_port: 5000
 
+# MQTT control surface. Omit this block entirely to run without one.
+mqtt:
+  enabled: true
+  # "host" or "host:port". Port defaults to 1883.
+  broker: "10.0.0.5:1883"
+  # MQTT client id. null -> "lucyfer".
+  client_id: null
+  # Credentials. Omit both for an anonymous broker. `password` and `password_file` are
+  # mutually exclusive; `password_file` holds the password as its (trimmed) contents,
+  # which keeps it out of this file.
+  username: null
+  password: null
+  password_file: null
+  # Topic prefix. Per speaker lucyfer publishes:
+  #   <prefix>/<mqtt_name>/status    retained JSON: source, playback, track, volume, position
+  #   <prefix>/<mqtt_name>/albumart  retained URL: Spotify's CDN link, or a base64 data: URL
+  #                                  for AirPlay, which pushes raw cover bytes
+  # and one bridge-wide topic:
+  #   <prefix>/availability          retained "online" / "offline" (last will)
+  prefix: "lucyfer"
+
 speakers:
+  # lucyfer always transmits full-scale audio to Dante and never attenuates it: volume
+  # belongs to the amplifier, and is only reported and relayed over MQTT (see the two
+  # topics below). Nothing is ever commanded on connect, so starting a speaker cannot
+  # produce a sudden loud noise.
   - name: "Living Room" # name shown in Spotify and AirPlay; Dante channels "Living Room L" / "Living Room R"
-    apply_volume: true # scale the Dante stream by the source's volume
-    initial_volume: 0.6 # 0.0 - 1.0, applied when a Spotify session connects
+    # Topic segment for this speaker. null -> the slug of `name`, i.e. "living-room".
+    mqtt_name: "living-room"
+    # The amplifier's *current* volume, 0-100. lucyfer SUBSCRIBES here: a value arriving
+    # on this topic is pushed into Spotify and AirPlay so their sliders show the truth.
+    volume_topic: "amps/living-room/volume"
+    # The amplifier's *command* topic, 0-100. lucyfer PUBLISHES here when the user moves
+    # the slider in the Spotify or AirPlay app. The amplifier applies it and mirrors it
+    # back on `volume_topic`, closing the loop. Not retained: a retained command replayed
+    # after a broker restart is exactly the volume jump this design avoids.
+    volume_topic_set: "amps/living-room/volume/set"
+  # Both volume topics must be given together, or neither. A speaker with neither is
+  # published and reported as usual, but its volume is not relayed anywhere.
   - name: "Kitchen"
-    apply_volume: false # send full-scale audio to Dante; report volume only

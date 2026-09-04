@@ -13,9 +13,9 @@
 //! prefills silence to give that clock drift headroom in both directions.
 
 use super::{CommandResult, PushResult, SourceControl, SourceKind, SpeakerAudio};
+use crate::config::{AirPlayConfig, SpeakerConfig};
 use crate::dante::Frame;
 use crate::resampler::SpeakerResampler;
-use crate::config::{AirPlayConfig, SpeakerConfig};
 use crate::state::{Artwork, Playback, StateHub, TrackInfo, now_ms};
 use anyhow::{Context, Result};
 use sha1::{Digest, Sha1};
@@ -45,7 +45,6 @@ struct AirPlayState {
     hub: StateHub,
     audio: Arc<SpeakerAudio>,
     dante_rate: u32,
-    apply_volume: bool,
     /// Last reported sender volume, in dB. -144 means muted.
     volume_db: AtomicU32,
     /// `now_ms()` of the last audio packet, for the paused heuristic.
@@ -76,15 +75,6 @@ impl AirPlayState {
             return 0.0;
         }
         ((db + VOLUME_DB_RANGE) / VOLUME_DB_RANGE).clamp(0.0, 1.0)
-    }
-
-    /// Sender dB -> a linear gain for `apply_volume`.
-    fn volume_gain(&self) -> f32 {
-        let db = self.volume_db();
-        if db <= -VOLUME_DB_RANGE * 2.0 {
-            return 0.0;
-        }
-        10f32.powf(db.min(0.0) / 20.0)
     }
 
     fn owns(&self) -> bool {
@@ -204,7 +194,8 @@ impl AudioHandler for AirPlayHandler {
         self.state.audio.claim(SourceKind::Airplay);
         self.state.last_frame_at.store(now_ms(), Ordering::Relaxed);
         self.state.reported_playing.store(false, Ordering::Relaxed);
-        self.state.update_if_owner(|s| s.playback = Playback::Loading);
+        self.state
+            .update_if_owner(|s| s.playback = Playback::Loading);
 
         let resampler = SpeakerResampler::new(format.sample_rate, self.state.dante_rate)
             .unwrap_or(SpeakerResampler::Bypass);
@@ -268,18 +259,22 @@ impl AudioHandler for AirPlayHandler {
     }
 
     fn on_remote_control(&self, remote: Arc<dyn RemoteControl>) {
-        tracing::debug!("speaker '{}': AirPlay remote control available", self.state.name);
+        tracing::debug!(
+            "speaker '{}': AirPlay remote control available",
+            self.state.name
+        );
         *self.state.remote.lock().unwrap() = Some(remote);
-        self.state
-            .audio
-            .register_control(Arc::new(AirPlayControl {
-                state: self.state.clone(),
-            }));
+        self.state.audio.register_control(Arc::new(AirPlayControl {
+            state: self.state.clone(),
+        }));
     }
 
     fn on_client_connected(&self, addr: &str) {
         self.state.connections.fetch_add(1, Ordering::Relaxed);
-        tracing::info!("speaker '{}': AirPlay client {addr} connected", self.state.name);
+        tracing::info!(
+            "speaker '{}': AirPlay client {addr} connected",
+            self.state.name
+        );
         let addr = addr.to_string();
         self.state.update_if_owner(|s| s.active_user = Some(addr));
     }
@@ -295,7 +290,10 @@ impl AudioHandler for AirPlayHandler {
         if remaining > 0 {
             return;
         }
-        tracing::info!("speaker '{}': AirPlay client {addr} disconnected", self.state.name);
+        tracing::info!(
+            "speaker '{}': AirPlay client {addr} disconnected",
+            self.state.name
+        );
 
         let was_owner = self.state.owns();
         self.state.reported_playing.store(false, Ordering::Relaxed);
@@ -322,7 +320,7 @@ struct AirPlaySession {
     state: Arc<AirPlayState>,
     resampler: SpeakerResampler,
     channels: usize,
-    /// Interleaved stereo scratch (downmixed and volume-scaled) fed to the resampler.
+    /// Interleaved stereo scratch (downmixed) fed to the resampler.
     stereo: Vec<f32>,
     /// Resampler output.
     frames: Vec<Frame>,
@@ -339,14 +337,8 @@ impl AudioSession for AirPlaySession {
             return;
         }
 
-        let gain = if self.state.apply_volume {
-            self.state.volume_gain()
-        } else {
-            1.0
-        };
-
         self.stereo.clear();
-        to_stereo(samples, self.channels, gain, &mut self.stereo);
+        to_stereo(samples, self.channels, &mut self.stereo);
 
         self.frames.clear();
         self.resampler.process_f32(&self.stereo, &mut self.frames);
@@ -365,7 +357,8 @@ impl AudioSession for AirPlaySession {
 
         self.state.last_frame_at.store(now_ms(), Ordering::Relaxed);
         if !self.state.reported_playing.swap(true, Ordering::Relaxed) {
-            self.state.update_if_owner(|s| s.playback = Playback::Playing);
+            self.state
+                .update_if_owner(|s| s.playback = Playback::Playing);
         }
     }
 
@@ -400,7 +393,6 @@ pub async fn run_speaker(
         hub,
         audio,
         dante_rate,
-        apply_volume: speaker.apply_volume,
         volume_db: AtomicU32::new(0f32.to_bits()),
         last_frame_at: AtomicU64::new(0),
         reported_playing: AtomicBool::new(false),
@@ -488,20 +480,23 @@ fn sniff_image(data: &[u8]) -> Option<&'static str> {
     }
 }
 
-/// Downmix to interleaved stereo and apply `gain`. Mono is duplicated; anything wider
-/// than stereo keeps its first two channels (shairplay is asked for at most 2 anyway).
-fn to_stereo(samples: &[f32], channels: usize, gain: f32, out: &mut Vec<f32>) {
+/// Downmix to interleaved stereo at full scale. Mono is duplicated; anything wider than
+/// stereo keeps its first two channels (shairplay is asked for at most 2 anyway).
+///
+/// No gain is applied here: volume lives in the amplifier and is only relayed over MQTT,
+/// so Dante always carries the full-scale signal.
+fn to_stereo(samples: &[f32], channels: usize, out: &mut Vec<f32>) {
     match channels {
         1 => {
             for &s in samples {
-                out.push(s * gain);
-                out.push(s * gain);
+                out.push(s);
+                out.push(s);
             }
         }
         n => {
             for frame in samples.chunks_exact(n) {
-                out.push(frame[0] * gain);
-                out.push(frame[1] * gain);
+                out.push(frame[0]);
+                out.push(frame[1]);
             }
         }
     }
@@ -529,16 +524,16 @@ mod tests {
     }
 
     #[test]
-    fn mono_is_duplicated_and_scaled() {
+    fn mono_is_duplicated() {
         let mut out = Vec::new();
-        to_stereo(&[1.0, -1.0], 1, 0.5, &mut out);
-        assert_eq!(out, vec![0.5, 0.5, -0.5, -0.5]);
+        to_stereo(&[1.0, -1.0], 1, &mut out);
+        assert_eq!(out, vec![1.0, 1.0, -1.0, -1.0]);
     }
 
     #[test]
     fn extra_channels_are_dropped() {
         let mut out = Vec::new();
-        to_stereo(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 3, 1.0, &mut out);
+        to_stereo(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 3, &mut out);
         assert_eq!(out, vec![1.0, 2.0, 4.0, 5.0]);
     }
 
@@ -548,5 +543,4 @@ mod tests {
         assert_eq!(sniff_image(b"\x89PNG\r\n"), Some("image/png"));
         assert_eq!(sniff_image(b"not an image"), None);
     }
-
 }

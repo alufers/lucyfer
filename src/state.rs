@@ -33,8 +33,6 @@ pub struct TrackInfo {
 }
 
 /// Album art bytes pushed by a source that has no public URL for them (AirPlay).
-// Read back by the control layer; kept for the upcoming MQTT client.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Artwork {
     pub bytes: Vec<u8>,
@@ -45,7 +43,6 @@ pub struct Artwork {
 pub struct SpeakerState {
     pub id: String,
     pub name: String,
-    pub apply_volume: bool,
     /// Sources this speaker is advertised on, in configuration order.
     pub sources: Vec<SourceKind>,
     /// Which source currently drives the Dante channels, if any.
@@ -63,11 +60,10 @@ pub struct SpeakerState {
 }
 
 impl SpeakerState {
-    pub fn new(id: String, name: String, apply_volume: bool, sources: Vec<SourceKind>) -> Self {
+    pub fn new(id: String, name: String, sources: Vec<SourceKind>) -> Self {
         Self {
             id,
             name,
-            apply_volume,
             sources,
             source: None,
             playback: Playback::Inactive,
@@ -82,7 +78,6 @@ impl SpeakerState {
     }
 
     /// A copy with `position_ms` advanced to the present if currently playing.
-    #[allow(dead_code)]
     pub fn extrapolated(&self) -> Self {
         let mut s = self.clone();
         if s.playback == Playback::Playing {
@@ -111,8 +106,6 @@ pub struct StateHub {
     events: broadcast::Sender<StateEvent>,
 }
 
-// The read side of the hub (`subscribe`, `get`, `get_artwork`, `all`) has no consumer
-// until the MQTT client lands; the write side is driven by the sources.
 impl StateHub {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(256);
@@ -133,7 +126,6 @@ impl StateHub {
             .insert(state.id.clone(), state);
     }
 
-    #[allow(dead_code)]
     pub fn subscribe(&self) -> broadcast::Receiver<StateEvent> {
         self.events.subscribe()
     }
@@ -148,12 +140,9 @@ impl StateHub {
             f(state);
             state.clone()
         };
-        let _ = self.events.send(StateEvent::SpeakerUpdate { speaker: updated });
-    }
-
-    #[allow(dead_code)]
-    pub fn get(&self, id: &str) -> Option<SpeakerState> {
-        self.snapshot.read().unwrap().get(id).map(|s| s.extrapolated())
+        let _ = self
+            .events
+            .send(StateEvent::SpeakerUpdate { speaker: updated });
     }
 
     /// Store album art bytes for a speaker, replacing any previous cover.
@@ -164,7 +153,6 @@ impl StateHub {
             .insert(id.to_string(), artwork);
     }
 
-    #[allow(dead_code)]
     pub fn get_artwork(&self, id: &str) -> Option<Artwork> {
         self.artwork.read().unwrap().get(id).cloned()
     }
@@ -174,7 +162,6 @@ impl StateHub {
     }
 
     /// All speakers in registration order, with positions extrapolated.
-    #[allow(dead_code)]
     pub fn all(&self) -> Vec<SpeakerState> {
         let map = self.snapshot.read().unwrap();
         self.order
