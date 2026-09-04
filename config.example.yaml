@@ -22,9 +22,6 @@ dante:
   # Media clock source. null -> inferno's default usrvclock socket.
   # Other values: a usrvclock socket path (e.g. "/clock/usrvclock") or "/dev/ptp0".
   clock_path: null
-  # Per-channel timeline ring buffer length in samples. MUST be a power of two.
-  # 65536 @ 48 kHz ~= 1.37 s of headroom.
-  ring_len: 65536
 
 spotify:
   # Advertise every speaker over Spotify Connect.
@@ -54,11 +51,3 @@ speakers:
     initial_volume: 0.6 # 0.0 - 1.0, applied when a Spotify session connects
   - name: "Kitchen"
     apply_volume: false # send full-scale audio to Dante; report volume only
-
-audio:
-  # Depth of the per-speaker pacing queue in milliseconds. Larger = more robust
-  # against jitter, but higher end-to-end latency. AirPlay also keeps this queue about
-  # half full to absorb sender-clock drift, so it sets the AirPlay latency too.
-  pacing_buffer_ms: 150
-  # How far ahead of the media clock the ring writer fills, in milliseconds.
-  lead_ms: 30

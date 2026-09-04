@@ -13,8 +13,8 @@
 //! prefills silence to give that clock drift headroom in both directions.
 
 use super::{CommandResult, PushResult, SourceControl, SourceKind, SpeakerAudio};
-use crate::audio::queue::Frame;
-use crate::audio::resampler::SpeakerResampler;
+use crate::dante::Frame;
+use crate::resampler::SpeakerResampler;
 use crate::config::{AirPlayConfig, SpeakerConfig};
 use crate::state::{Artwork, Playback, StateHub, TrackInfo, now_ms};
 use anyhow::{Context, Result};
@@ -361,13 +361,6 @@ impl AudioSession for AirPlaySession {
         match result {
             PushResult::Written => self.state.note_dropped(dropped),
             PushResult::Preempted => return,
-            PushResult::Disconnected => {
-                tracing::error!(
-                    "speaker '{}': Dante ring writer stopped; discarding AirPlay audio",
-                    self.state.name
-                );
-                return;
-            }
         }
 
         self.state.last_frame_at.store(now_ms(), Ordering::Relaxed);

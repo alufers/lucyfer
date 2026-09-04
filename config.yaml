@@ -3,7 +3,7 @@
 # See config.example.yaml for the fully documented schema.
 
 dante:
-  interface: "enp195s0f0" # <-- set to your Dante NIC name or its IPv4 address
+  interface: "10.165.1.192" # <-- set to your Dante NIC name or its IPv4 address
   device_name: "lucyfer"
   sample_rate: 48000
   tx_latency_ns: 10000000
@@ -12,7 +12,6 @@ dante:
   # In production the bundled Statime daemon (LUCYFER_PTP=1) publishes it at
   # inferno's default path instead, and this can be null.
   clock_path: "/clock/usrvclock"
-  ring_len: 65536
 
 spotify:
   enabled: true
@@ -35,7 +34,3 @@ speakers:
   - name: "Kuźnia"
   - name: "CNC"
   - name: "Maszynownia"
-    
-audio:
-  pacing_buffer_ms: 150
-  lead_ms: 30

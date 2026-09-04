@@ -1,9 +1,9 @@
 //! lucyfer — expose Spotify Connect and AirPlay speakers, transmitting their audio
 //! over Dante.
 
-mod audio;
 mod config;
 mod dante;
+mod resampler;
 mod source;
 mod state;
 
@@ -58,16 +58,18 @@ async fn main() -> Result<()> {
 
     let hub = StateHub::new();
 
-    // One pacing queue per speaker, shared by every source through `SpeakerAudio`.
-    let pacing_frames =
-        (cfg.dante.sample_rate as u64 * cfg.audio.pacing_buffer_ms as u64 / 1000) as usize;
-    let lead_samples = (cfg.dante.sample_rate as u64 * cfg.audio.lead_ms as u64 / 1000) as usize;
+    // Start the Dante device. Startup does NOT block on the media clock: discovery comes
+    // up immediately; only audio TX is gated until a media clock (PTP/usrvclock) becomes
+    // available.
+    let speaker_names: Vec<String> = cfg.speakers.iter().map(|sp| sp.name.clone()).collect();
+    let (dante, sinks) = dante::DanteOutput::start(&cfg.dante, &speaker_names)
+        .await
+        .context("starting Dante output")?;
 
+    // One sink per speaker, shared by every source through `SpeakerAudio`.
     let registry = SpeakerRegistry::new();
     let mut speaker_audio = Vec::new();
-    let mut consumers = Vec::new();
-    let mut speaker_names = Vec::new();
-    for sp in &cfg.speakers {
+    for (sp, sink) in cfg.speakers.iter().zip(sinks) {
         let id = speaker_id(&sp.name);
         hub.register(SpeakerState::new(
             id.clone(),
@@ -75,28 +77,10 @@ async fn main() -> Result<()> {
             sp.apply_volume,
             sources.clone(),
         ));
-        let (producer, consumer) = audio::queue::channel(pacing_frames);
-        let audio = Arc::new(SpeakerAudio::new(
-            id,
-            sp.name.clone(),
-            hub.clone(),
-            producer,
-            // Real-time sources (AirPlay) keep the queue around half full so a
-            // free-running sender clock has drift headroom in both directions.
-            pacing_frames / 2,
-        ));
+        let audio = Arc::new(SpeakerAudio::new(id, sp.name.clone(), hub.clone(), sink));
         registry.insert(audio.clone());
         speaker_audio.push(audio);
-        consumers.push(consumer);
-        speaker_names.push(sp.name.clone());
     }
-
-    // Start the Dante device + ring writer. Startup does NOT block on the media clock:
-    // discovery comes up immediately; only audio TX is gated until a media clock
-    // (PTP/usrvclock) becomes available.
-    let dante = dante::DanteOutput::start(&cfg.dante, &speaker_names, consumers, lead_samples)
-        .await
-        .context("starting Dante output")?;
 
     // Spawn one task per (speaker, enabled source).
     let mut source_tasks = Vec::new();

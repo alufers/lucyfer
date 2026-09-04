@@ -12,8 +12,6 @@ pub struct Config {
     #[serde(default)]
     pub airplay: AirPlayConfig,
     pub speakers: Vec<SpeakerConfig>,
-    #[serde(default)]
-    pub audio: AudioConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -29,8 +27,6 @@ pub struct DanteConfig {
     /// null -> inferno default usrvclock socket; else a socket path or "/dev/ptp0".
     #[serde(default)]
     pub clock_path: Option<String>,
-    #[serde(default = "default_ring_len")]
-    pub ring_len: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -74,14 +70,6 @@ pub struct SpeakerConfig {
     pub initial_volume: Option<f32>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct AudioConfig {
-    #[serde(default = "default_pacing_buffer_ms")]
-    pub pacing_buffer_ms: u32,
-    #[serde(default = "default_lead_ms")]
-    pub lead_ms: u32,
-}
-
 impl Default for SpotifyConfig {
     fn default() -> Self {
         Self {
@@ -103,15 +91,6 @@ impl Default for AirPlayConfig {
     }
 }
 
-impl Default for AudioConfig {
-    fn default() -> Self {
-        Self {
-            pacing_buffer_ms: default_pacing_buffer_ms(),
-            lead_ms: default_lead_ms(),
-        }
-    }
-}
-
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -127,11 +106,6 @@ impl Config {
         anyhow::ensure!(
             self.spotify.enabled || self.airplay.enabled,
             "at least one audio source must be enabled (spotify.enabled / airplay.enabled)"
-        );
-        anyhow::ensure!(
-            self.dante.ring_len.is_power_of_two(),
-            "dante.ring_len ({}) must be a power of two",
-            self.dante.ring_len
         );
         if self.airplay.enabled {
             // Speaker N listens on base_port + N, so the whole block must fit.
@@ -171,9 +145,6 @@ fn default_sample_rate() -> u32 {
 fn default_tx_latency_ns() -> u32 {
     10_000_000
 }
-fn default_ring_len() -> usize {
-    65536
-}
 fn default_bitrate() -> u32 {
     320
 }
@@ -182,12 +153,6 @@ fn default_airplay_base_port() -> u16 {
 }
 fn default_true() -> bool {
     true
-}
-fn default_pacing_buffer_ms() -> u32 {
-    150
-}
-fn default_lead_ms() -> u32 {
-    30
 }
 
 #[cfg(test)]
@@ -208,7 +173,6 @@ speakers:
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.dante.sample_rate, 48000);
-        assert_eq!(cfg.dante.ring_len, 65536);
         assert_eq!(cfg.speakers.len(), 2);
         // apply_volume defaults to true
         assert!(cfg.speakers[0].apply_volume);
@@ -260,20 +224,6 @@ speakers:
   - name: "A"
   - name: "B"
   - name: "C"
-"#;
-        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn rejects_non_power_of_two_ring() {
-        let yaml = r#"
-dante:
-  interface: "eth0"
-  ring_len: 1000
-spotify: {}
-speakers:
-  - name: "A"
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(cfg.validate().is_err());

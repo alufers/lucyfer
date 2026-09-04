@@ -3,8 +3,8 @@
 //! Session/Player/Spirc wired to this speaker's Dante pacing queue.
 
 use super::{CommandResult, PushResult, SourceControl, SourceKind, SpeakerAudio, speaker_id};
-use crate::audio::queue::Frame;
-use crate::audio::resampler::SpeakerResampler;
+use crate::dante::Frame;
+use crate::resampler::SpeakerResampler;
 use crate::config::{SpeakerConfig, SpotifyConfig};
 use crate::state::{Playback, StateHub, TrackInfo, now_ms};
 use anyhow::{Context, Result};
@@ -99,8 +99,8 @@ impl SourceControl for SpotifyControl {
 
 // --- audio sink ---
 
-/// A librespot audio `Sink` that resamples the decoded stream and pushes it into the
-/// speaker's pacing queue. Blocking on a full queue is what paces librespot.
+/// A librespot audio `Sink` that resamples the decoded stream and writes it into the
+/// speaker's Dante rings. Blocking on a full buffer is what paces librespot.
 struct DanteSink {
     resampler: SpeakerResampler,
     audio: Arc<SpeakerAudio>,
@@ -139,15 +139,11 @@ impl Sink for DanteSink {
         self.scratch.clear();
         self.resampler.process(samples, &mut self.scratch);
 
-        match self.audio.push_blocking(SourceKind::Spotify, &self.scratch) {
-            PushResult::Written => Ok(()),
-            // Another source owns the speaker. Swallow the audio (the queue must not see
-            // it) but keep the session alive, so a later `claim` resumes seamlessly.
-            PushResult::Preempted => Ok(()),
-            PushResult::Disconnected => {
-                Err(SinkError::NotConnected("dante ring writer stopped".into()))
-            }
-        }
+        // `Preempted` means another source owns the speaker: swallow the audio (Dante
+        // must not see it) but keep the session alive, so a later `claim` resumes
+        // seamlessly.
+        let _: PushResult = self.audio.push_blocking(SourceKind::Spotify, &self.scratch);
+        Ok(())
     }
 }
 

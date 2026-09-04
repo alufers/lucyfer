@@ -1,102 +1,62 @@
 //! Dante (inferno_aoip) TX side: one `DeviceServer` exposing two TX channels per
-//! speaker, fed by timeline-indexed ring buffers written by the `RingWriter` thread.
+//! speaker, written directly by the audio sources through a per-speaker [`SpeakerSink`].
+//!
+//! inferno owns the rings and tracks how far we have written (`readable_pos`), so
+//! everything we do *not* write is transmitted as silence. There is no writer thread and
+//! no queue: a source writes when it has audio, and stops writing when it doesn't.
+//!
+//! # Timeline
+//!
+//! We hand inferno a start time of 0, so it reads each cycle at
+//! `media_clock_now - tx_latency` on the raw media-clock timeline. A sink therefore
+//! writes at `media_clock_now + LEAD`, keeping `LEAD + tx_latency` of audio ahead of the
+//! transmitter. The clock is read per sink from the device's own clock receiver, never
+//! from inferno's published read position — that one stops advancing whenever no Dante
+//! receiver is subscribed, which would stall playback.
 
-pub mod writer;
-
-use crate::audio::QueueConsumer;
 use crate::config::DanteConfig;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use inferno_aoip::device_server::{
-    AtomicSample, DeviceServer, ExternalBufferParameters, MediaClock, Sample, Settings,
-    TransferNotifier,
+    AtomicSample, DeviceServer, MediaClock, OwnedBuffer, RBInput, RealTimeClockReceiver, Sample,
+    Settings,
 };
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
-use std::time::Duration;
-use writer::RingWriter;
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Mutex};
 
-/// A single timeline-indexed TX ring. The transmitter reads `buf[ts & mask]`.
-pub struct TimelineRing {
-    buf: Arc<Vec<AtomicSample>>,
-    valid: Arc<RwLock<bool>>,
-    mask: usize,
-}
+/// One stereo frame of Dante samples (i32, MSB-aligned).
+pub type Frame = [Sample; 2];
 
-impl TimelineRing {
-    fn new(len: usize) -> Self {
-        assert!(len.is_power_of_two());
-        let buf = Arc::new((0..len).map(|_| AtomicSample::new(0)).collect::<Vec<_>>());
-        Self {
-            buf,
-            valid: Arc::new(RwLock::new(true)),
-            mask: len - 1,
-        }
-    }
+/// Per-channel ring length in samples. MUST be a power of two; 65536 @ 48 kHz ~= 1.37 s,
+/// which is far more than the write-ahead below ever needs.
+const RING_LEN: usize = 65536;
 
-    #[inline]
-    pub fn write(&self, ts: usize, s: Sample) {
-        self.buf[ts & self.mask].store(s, Ordering::Relaxed);
-    }
+/// How far ahead of the media clock a sink keeps its write cursor. This *is* the
+/// end-to-end buffer: larger absorbs more jitter at the cost of latency.
+const LEAD_MS: u64 = 150;
 
-    #[cfg(test)]
-    #[inline]
-    pub fn read(&self, ts: usize) -> Sample {
-        self.buf[ts & self.mask].load(Ordering::Relaxed)
-    }
+/// How long inferno waits before silence-filling a gap left by a cursor re-anchor.
+const HOLE_FIX_MS: u64 = 10;
 
-    /// Build the `ExternalBufferParameters` inferno needs to read this ring.
-    ///
-    /// # Safety
-    /// The returned params hold a raw pointer into `self.buf`. inferno only reads
-    /// through it while the `valid` flag is true; we keep `buf` alive for the whole
-    /// process (it is `Arc`-cloned into the struct) and flip `valid` to false before
-    /// teardown, so the pointer never dangles during a read.
-    fn params(&self) -> ExternalBufferParameters<Sample> {
-        unsafe {
-            ExternalBufferParameters::new(
-                self.buf.as_ptr(),
-                self.buf.len(),
-                1,
-                self.valid.clone(),
-                None, // unconditional read (timeline-indexed)
-            )
-        }
-    }
-
-    fn clone_handle(&self) -> Self {
-        Self {
-            buf: self.buf.clone(),
-            valid: self.valid.clone(),
-            mask: self.mask,
-        }
-    }
-
-    fn invalidate(&self) {
-        *self.valid.write().unwrap() = false;
-    }
+/// Signed wrapping difference `a - b` over the timeline (see inferno's `wrapsub`).
+#[inline]
+fn wrapsub(a: usize, b: usize) -> isize {
+    (a as isize).wrapping_sub(b as isize)
 }
 
 pub struct DanteOutput {
-    pub server: DeviceServer,
-    rings: Vec<TimelineRing>,
-    writer_shutdown: Arc<AtomicBool>,
-    writer_handle: Option<std::thread::JoinHandle<()>>,
-    wake: Arc<(Mutex<bool>, Condvar)>,
+    server: DeviceServer,
 }
 
 impl DanteOutput {
-    /// Start the Dante device and the ring writer. Consumes one `QueueConsumer` per
-    /// speaker (in the same order as `speaker_names`).
+    /// Start the Dante device, returning one sink per speaker in `speaker_names` order.
     ///
-    /// NOTE: `DeviceServer::start` blocks until a media clock is available.
+    /// Startup does not block on the media clock: discovery comes up immediately and the
+    /// sinks simply drop audio (inferno transmits silence) until a clock arrives.
     pub async fn start(
         cfg: &DanteConfig,
         speaker_names: &[String],
-        consumers: Vec<QueueConsumer>,
-        lead_samples: usize,
-    ) -> Result<Self> {
-        assert_eq!(speaker_names.len(), consumers.len());
+    ) -> Result<(Self, Vec<Arc<SpeakerSink>>)> {
         let tx_channels = speaker_names.len() * 2;
 
         let mut config = BTreeMap::new();
@@ -131,192 +91,228 @@ impl DanteOutput {
             tx_channels,
             cfg.sample_rate
         );
-        describe_clock_source(&cfg.clock_path);
         let mut server = DeviceServer::start(settings).await;
+
         let sample_rate = cfg.sample_rate as u64;
+        let lead = (sample_rate * LEAD_MS / 1000) as usize;
+        let hole_fix_wait = (sample_rate * HOLE_FIX_MS / 1000) as usize;
 
-        // Build rings (2 per speaker) and their external params.
-        let rings: Vec<TimelineRing> =
-            (0..tx_channels).map(|_| TimelineRing::new(cfg.ring_len)).collect();
-        let params: Vec<ExternalBufferParameters<Sample>> = rings.iter().map(|r| r.params()).collect();
-
-        let current_timestamp = Arc::new(AtomicUsize::new(usize::MAX));
-        let wake = Arc::new((Mutex::new(false), Condvar::new()));
-        let notifier = {
-            let wake = wake.clone();
-            TransferNotifier {
-                callback: Box::new(move || {
-                    let (lock, cvar) = &*wake;
-                    if let Ok(mut g) = lock.lock() {
-                        *g = true;
-                        cvar.notify_one();
-                    }
-                }),
-                max_interval_samples: (sample_rate / 100) as usize, // ~10 ms
-            }
-        };
-
+        // Start time 0 keeps the ring timeline identical to the media clock timeline.
         let (start_tx, start_rx) = tokio::sync::oneshot::channel::<usize>();
-        server
-            .transmit_from_external_buffer(params, start_rx, current_timestamp, Some(notifier))
+        let _ = start_tx.send(0);
+        let rb_inputs = server
+            .transmit_from_owned_buffer(
+                tx_channels,
+                RING_LEN,
+                hole_fix_wait,
+                start_rx,
+                // Neither of these is used: we pace off the media clock instead.
+                Arc::new(AtomicUsize::new(usize::MAX)),
+                Arc::new(AtomicUsize::new(usize::MAX)),
+                None,
+                None,
+            )
             .await;
 
-        // Anchor the TX timeline once a media clock is actually available. This runs
-        // in the background so the Spotify Connect side and the API come up
-        // immediately even when no clock is present yet (audio simply starts flowing
-        // once the clock arrives). Blocking here would gate discovery on the clock.
-        {
-            let clock_rx = server.get_realtime_clock_receiver();
-            let clock_path = cfg.clock_path.clone();
-            tokio::spawn(async move {
-                tracing::warn!(
-                    "Dante TX is waiting for a media clock (PTP/usrvclock); \
-                     no audio will be transmitted until one is available"
-                );
-                let start_ts = wait_for_clock(clock_rx, sample_rate, clock_path).await;
-                let _ = start_tx.send(start_ts);
-                tracing::info!("Dante media clock acquired; TX timeline anchored");
-            });
+        // Two channels per speaker, in the order the TX channels were named above.
+        let mut rb_inputs = rb_inputs.into_iter();
+        let mut sinks = Vec::with_capacity(speaker_names.len());
+        for _ in speaker_names {
+            let pair = [rb_inputs.next().unwrap(), rb_inputs.next().unwrap()];
+            sinks.push(Arc::new(SpeakerSink::new(
+                pair,
+                sample_rate,
+                lead,
+                Some(server.get_realtime_clock_receiver()),
+            )));
         }
 
-        // Spawn the ring writer thread.
-        let writer_shutdown = Arc::new(AtomicBool::new(false));
-        let writer = RingWriter {
-            rings: rings.iter().map(|r| r.clone_handle()).collect(),
-            consumers,
-            clock_rx: server.get_realtime_clock_receiver(),
-            sample_rate,
-            lead_samples,
-        };
-        let writer_handle = {
-            let wake = wake.clone();
-            let shutdown = writer_shutdown.clone();
-            std::thread::Builder::new()
-                .name("dante-ring-writer".to_string())
-                .spawn(move || {
-                    if let Err(e) = raise_thread_priority() {
-                        tracing::warn!("could not raise ring-writer thread priority: {e:#}");
-                    }
-                    writer.run(wake, shutdown);
-                })
-                .context("spawning ring writer thread")?
-        };
-
-        Ok(Self {
-            server,
-            rings,
-            writer_shutdown,
-            writer_handle: Some(writer_handle),
-            wake,
-        })
+        Ok((Self { server }, sinks))
     }
 
-    pub async fn shutdown(mut self) {
-        // Stop the writer first so it no longer touches the rings.
-        self.writer_shutdown.store(true, Ordering::Relaxed);
-        let (lock, cvar) = &*self.wake;
-        if let Ok(mut g) = lock.lock() {
-            *g = true;
-            cvar.notify_all();
-        }
-        if let Some(h) = self.writer_handle.take() {
-            let _ = h.join();
-        }
-        // Invalidate rings before the transmitter is torn down / buffers drop.
-        for r in &self.rings {
-            r.invalidate();
-        }
+    pub async fn shutdown(self) {
         self.server.shutdown().await;
     }
 }
 
-/// The effective media-clock source path: the configured `clock_path`, or inferno's
-/// default usrvclock socket when unset.
-fn resolve_clock_path(clock_path: &Option<String>) -> String {
-    clock_path
-        .clone()
-        .unwrap_or_else(|| usrvclock::DEFAULT_SERVER_SOCKET_PATH.to_string())
+type ChannelRing = RBInput<Sample, OwnedBuffer<AtomicSample>>;
+
+/// One speaker's pair of TX rings plus the write cursor into them.
+pub struct SpeakerSink {
+    /// Target write-ahead over the media clock, in samples.
+    lead: usize,
+    inner: Mutex<Inner>,
 }
 
-/// Log the effective media-clock source at startup so a missing or invalid one is
-/// obvious. This never fails or aborts: by design the service still comes up without a
-/// clock (discovery + API), and only audio TX is gated until a clock arrives.
-fn describe_clock_source(clock_path: &Option<String>) {
-    use std::os::unix::fs::FileTypeExt;
+struct Inner {
+    /// The speaker's two rings: [L, R].
+    rb: [ChannelRing; 2],
+    sample_rate: u64,
+    clock: MediaClock,
+    /// `None` only in tests, where there is no device and hence no clock.
+    clock_rx: Option<RealTimeClockReceiver>,
+    /// Next timeline position to write, or `None` until the first write anchors it.
+    cursor: Option<usize>,
+}
 
-    let path = resolve_clock_path(clock_path);
-    match std::fs::metadata(&path) {
-        Ok(md) => {
-            let ft = md.file_type();
-            if ft.is_char_device() {
-                tracing::info!("media clock: using PTP char device '{path}'");
-            } else if ft.is_socket() {
-                tracing::info!("media clock: using usrvclock server socket '{path}'");
-            } else {
-                tracing::warn!(
-                    "media clock: '{path}' is neither a char device nor a socket, so it \
-                     is almost certainly not a valid clock source. Set dante.clock_path \
-                     to a PTP char device (e.g. /dev/ptp0) or a usrvclock socket."
-                );
+impl SpeakerSink {
+    fn new(
+        rb: [ChannelRing; 2],
+        sample_rate: u64,
+        lead: usize,
+        clock_rx: Option<RealTimeClockReceiver>,
+    ) -> Self {
+        Self {
+            lead,
+            inner: Mutex::new(Inner {
+                rb,
+                sample_rate,
+                clock: MediaClock::new(false),
+                clock_rx,
+                cursor: None,
+            }),
+        }
+    }
+
+    /// Write as many frames as the buffer window currently allows, returning how many
+    /// were taken. `0` means the cursor is already a full `lead` ahead (or there is no
+    /// media clock yet) and the caller should park and retry — this is what paces a
+    /// decode-ahead source.
+    pub fn try_write(&self, frames: &[Frame]) -> usize {
+        self.write(frames, self.lead)
+    }
+
+    /// Write what fits without ever asking the caller to wait, returning how many frames
+    /// were taken; the rest are dropped.
+    ///
+    /// A real-time source (AirPlay) runs on its own free-running clock, so it is allowed
+    /// a further `lead` of slack above the paced ceiling to absorb drift in both
+    /// directions. Overshooting that drops audio; falling behind re-anchors, which
+    /// rebuilds the cushion with silence.
+    pub fn write_realtime(&self, frames: &[Frame]) -> usize {
+        self.write(frames, self.lead * 2)
+    }
+
+    /// Silence everything written but not yet transmitted, and drop the cursor so the
+    /// next write starts a fresh buffer.
+    ///
+    /// Used when a source takes over the speaker (so the displaced source's audio never
+    /// reaches Dante) and on an AirPlay flush.
+    pub fn reset(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        if let (Some(now), Some(cursor)) = (inner.media_now(), inner.cursor) {
+            let pending = wrapsub(cursor, now);
+            if pending > 0 {
+                let n = (pending as usize).min(RING_LEN / 4);
+                for rb in &mut inner.rb {
+                    rb.write_from_at(now, std::iter::repeat_n(0 as Sample, n));
+                }
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::error!(
-                "media clock: '{path}' does not exist — no PTP char device and no \
-                 usrvclock server socket. NO AUDIO will be transmitted until a media \
-                 clock is available. Run a PTP daemon that publishes a usrvclock socket \
-                 (Statime/ptp4l bridge) and point dante.clock_path at it, or set it to a \
-                 PTP char device such as /dev/ptp0."
-            );
+        inner.cursor = None;
+    }
+
+    fn write(&self, frames: &[Frame], max_ahead: usize) -> usize {
+        if frames.is_empty() {
+            return 0;
         }
-        Err(e) => {
-            tracing::warn!("media clock: cannot stat '{path}': {e}");
+        let mut inner = self.inner.lock().unwrap();
+        let Some(now) = inner.media_now() else {
+            return 0;
+        };
+
+        let cursor = resolve_cursor(inner.cursor, now, self.lead);
+        let room = wrapsub(now.wrapping_add(max_ahead), cursor);
+        if room <= 0 {
+            // Keep the resolved cursor: a re-anchor must not be recomputed next call.
+            inner.cursor = Some(cursor);
+            return 0;
         }
+
+        let n = frames.len().min(room as usize).min(RING_LEN / 4);
+        inner.rb[0].write_from_at(cursor, frames[..n].iter().map(|f| f[0]));
+        inner.rb[1].write_from_at(cursor, frames[..n].iter().map(|f| f[1]));
+        inner.cursor = Some(cursor.wrapping_add(n));
+        n
+    }
+
+    /// A sink with no device behind it, for tests: it has rings but no clock, so every
+    /// write is dropped.
+    #[cfg(test)]
+    pub fn detached() -> Self {
+        use inferno_aoip::device_server::new_owned_ring_buffer;
+        let l = new_owned_ring_buffer(RING_LEN, 0, 480).0;
+        let r = new_owned_ring_buffer(RING_LEN, 0, 480).0;
+        Self::new([l, r], 48000, 7200, None)
     }
 }
 
-async fn wait_for_clock(
-    mut clock_rx: inferno_aoip::device_server::RealTimeClockReceiver,
-    sample_rate: u64,
-    clock_path: Option<String>,
-) -> usize {
-    let resolved = resolve_clock_path(&clock_path);
-    let mut media_clock = MediaClock::new(false);
-    let mut iters: u64 = 0;
-    loop {
+impl Inner {
+    /// The media clock's current position on the TX timeline, or `None` while no clock
+    /// (PTP / usrvclock) is available.
+    fn media_now(&mut self) -> Option<usize> {
+        let clock_rx = self.clock_rx.as_mut()?;
         clock_rx.update();
         if let Some(overlay) = clock_rx.get() {
-            media_clock.update_overlay(*overlay);
-            if let Some(now) = media_clock.wrapping_now_in_timebase(sample_rate) {
-                return now as usize;
-            }
+            self.clock.update_overlay(*overlay);
         }
-        iters += 1;
-        // ~100 ms per iteration; re-warn every ~10 s so a stuck clock is visible in a
-        // log tail, not just a single line at boot.
-        if iters % 100 == 0 {
-            tracing::warn!(
-                "still waiting for a media clock from '{resolved}' after {} s; \
-                 no audio is being transmitted",
-                iters / 10
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // `Clock` is a `usize` on the same timeline inferno's transmitter reads from.
+        self.clock.wrapping_now_in_timebase(self.sample_rate)
     }
 }
 
-#[cfg(target_os = "linux")]
-fn raise_thread_priority() -> Result<()> {
-    use thread_priority::{
-        RealtimeThreadSchedulePolicy, ThreadPriority, ThreadSchedulePolicy, set_thread_priority_and_policy,
-        thread_native_id,
-    };
-    let policy = ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo);
-    set_thread_priority_and_policy(thread_native_id(), ThreadPriority::Crossplatform(50u8.try_into().unwrap()), policy)
-        .map_err(|e| anyhow::anyhow!("{e:?}"))
+/// Decide where to write next: keep the cursor where it is while it sits in the window
+/// the media clock has moved it into, otherwise (re)anchor a full `lead` ahead.
+///
+/// Anchoring happens on the first write, after a [`SpeakerSink::reset`], when the source
+/// has fallen behind the clock (underrun, or a long pause), and when the cursor is
+/// absurdly far ahead (a clock jump). The resulting gap is silence-filled by inferno's
+/// own hole handling, so the audio after it lands at the right time rather than late.
+#[inline]
+fn resolve_cursor(cursor: Option<usize>, now: usize, lead: usize) -> usize {
+    match cursor {
+        Some(c) if wrapsub(c, now) > 0 && wrapsub(c, now.wrapping_add(lead * 4)) <= 0 => c,
+        _ => now.wrapping_add(lead),
+    }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn raise_thread_priority() -> Result<()> {
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_is_kept_while_inside_the_window() {
+        // Comfortably ahead of the clock but not absurdly so: keep it.
+        assert_eq!(resolve_cursor(Some(1100), 1000, 100), 1100);
+        assert_eq!(resolve_cursor(Some(1001), 1000, 100), 1001);
+    }
+
+    #[test]
+    fn cursor_is_anchored_when_unset_or_out_of_the_window() {
+        // First write.
+        assert_eq!(resolve_cursor(None, 1000, 100), 1100);
+        // Fallen behind the clock (underrun / long pause).
+        assert_eq!(resolve_cursor(Some(900), 1000, 100), 1100);
+        assert_eq!(resolve_cursor(Some(1000), 1000, 100), 1100);
+        // Absurdly far ahead (clock jumped backwards).
+        assert_eq!(resolve_cursor(Some(1000 + 401), 1000, 100), 1100);
+    }
+
+    #[test]
+    fn cursor_survives_timeline_wraparound() {
+        let now = usize::MAX - 10;
+        // The cursor has wrapped past zero while the clock has not yet.
+        assert_eq!(resolve_cursor(Some(89), now, 100), 89);
+        assert_eq!(resolve_cursor(None, now, 100), 89);
+    }
+
+    #[test]
+    fn detached_sink_drops_everything() {
+        let sink = SpeakerSink::detached();
+        assert_eq!(sink.try_write(&[[1, 1], [2, 2]]), 0);
+        assert_eq!(sink.write_realtime(&[[1, 1]]), 0);
+        // Nothing to silence, and no cursor to keep.
+        sink.reset();
+        assert!(sink.inner.lock().unwrap().cursor.is_none());
+    }
 }

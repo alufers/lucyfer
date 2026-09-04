@@ -3,19 +3,19 @@
 //! A speaker is a single stereo pair of Dante TX channels that is advertised
 //! simultaneously by every enabled source (Spotify Connect and AirPlay). Only one
 //! source may drive those channels at a time, so each speaker owns a [`SpeakerAudio`]:
-//! the pacing queue plus a lock-free "who owns this speaker" flag and the registered
+//! the Dante sink plus a lock-free "who owns this speaker" flag and the registered
 //! per-source control surfaces.
 //!
 //! Arbitration is **last writer wins**: whichever source starts playing most recently
 //! claims the speaker, and the displaced source is gracefully told to stop
 //! ([`SourceControl::yield_now`] — `spirc.pause()` for Spotify, a DACP pause for
-//! AirPlay) and gated off the queue. Both network sessions stay alive, so switching
+//! AirPlay) and gated off the sink. Both network sessions stay alive, so switching
 //! back is immediate.
 
 pub mod airplay;
 pub mod spotify;
 
-use crate::audio::queue::{DiscardRequest, Frame, QueueProducer};
+use crate::dante::{Frame, SpeakerSink};
 use crate::state::StateHub;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -118,48 +118,34 @@ pub fn dispatch(
     Ok(result)
 }
 
-/// Result of handing frames to a speaker's queue.
+/// Result of handing frames to a speaker's Dante sink.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PushResult {
     Written,
     /// Another source took the speaker mid-write; the caller's audio was dropped.
     Preempted,
-    /// The ring writer is gone, so nothing will ever drain the queue again.
-    Disconnected,
 }
 
-/// One speaker's audio path: the pacing queue, the current owner, and the registered
+/// One speaker's audio path: the Dante sink, the current owner, and the registered
 /// source controls.
 pub struct SpeakerAudio {
     pub id: String,
     pub name: String,
     hub: StateHub,
-    producer: Mutex<QueueProducer>,
-    discard: DiscardRequest,
+    sink: Arc<SpeakerSink>,
     owner: AtomicU8,
     controls: Mutex<HashMap<SourceKind, Arc<dyn SourceControl>>>,
-    /// Queue depth a real-time source is topped back up to. See [`Self::push_realtime`].
-    realtime_target_frames: usize,
 }
 
 impl SpeakerAudio {
-    pub fn new(
-        id: String,
-        name: String,
-        hub: StateHub,
-        producer: QueueProducer,
-        realtime_target_frames: usize,
-    ) -> Self {
-        let discard = producer.discard_request();
+    pub fn new(id: String, name: String, hub: StateHub, sink: Arc<SpeakerSink>) -> Self {
         Self {
             id,
             name,
             hub,
-            producer: Mutex::new(producer),
-            discard,
+            sink,
             owner: AtomicU8::new(OWNER_NONE),
             controls: Mutex::new(HashMap::new()),
-            realtime_target_frames,
         }
     }
 
@@ -235,9 +221,9 @@ impl SpeakerAudio {
             tracing::info!("speaker '{}': {} started playing", self.name, kind.label());
         }
 
-        // Drop whatever the displaced source had already queued so its audio never
-        // reaches Dante. A real-time producer re-centres itself on its next push.
-        self.discard.request();
+        // Scrub whatever the displaced source had already written so its audio never
+        // reaches Dante. The new owner anchors a fresh buffer on its first write.
+        self.sink.reset();
         self.publish_owner();
     }
 
@@ -250,7 +236,7 @@ impl SpeakerAudio {
         {
             return;
         }
-        self.discard.request();
+        self.sink.reset();
         self.publish_owner();
     }
 
@@ -261,30 +247,22 @@ impl SpeakerAudio {
 
     // --- audio ---
 
-    /// Push all frames, parking while the queue is full. Blocking here is what paces a
-    /// decode-ahead source (Spotify); it must only be called from a dedicated thread.
-    ///
-    /// The producer lock is released between attempts so a source switch never waits on
-    /// a parked writer.
+    /// Push all frames, parking while the sink is already a full buffer ahead of the
+    /// media clock. Blocking here is what paces a decode-ahead source (Spotify); it must
+    /// only be called from a dedicated thread.
     pub fn push_blocking(&self, kind: SourceKind, mut frames: &[Frame]) -> PushResult {
         while !frames.is_empty() {
             if !self.is_owner(kind) {
                 return PushResult::Preempted;
             }
-            let pushed = {
-                let mut producer = self.producer.lock().unwrap();
-                if !producer.is_consumer_alive() {
-                    return PushResult::Disconnected;
-                }
-                producer.push_some(frames)
-            };
-            if pushed == 0 {
-                // Queue full: wait for the ring writer to drain some. One frame at
-                // 48 kHz is ~20 us; parking ~1 ms beats busy-spinning.
+            let written = self.sink.try_write(frames);
+            if written == 0 {
+                // Buffer full (or no media clock yet). One frame at 48 kHz is ~20 us;
+                // parking ~1 ms beats busy-spinning.
                 std::thread::sleep(Duration::from_millis(1));
                 continue;
             }
-            frames = &frames[pushed..];
+            frames = &frames[written..];
         }
         PushResult::Written
     }
@@ -293,37 +271,22 @@ impl SpeakerAudio {
     ///
     /// Used by real-time sources (AirPlay), whose callbacks run on tokio tasks — parking
     /// there would stall a runtime worker — and which cannot be back-pressured anyway.
-    ///
-    /// Such a source runs on its own free-running clock, so its queue depth drifts
-    /// against the Dante media clock in both directions. Before every push the queue is
-    /// topped back up to `realtime_target_frames` if it has fallen near empty, which
-    /// both establishes the initial cushion and re-establishes it after a drain (a
-    /// source switch, a flush, or drift). Overflow at the other end is handled by
-    /// dropping the tail. Either way the correction is a glitch, but a bounded one:
-    /// without it the queue would sit at zero and underrun continuously.
+    /// The sink gives them extra slack above the paced ceiling and re-anchors when they
+    /// fall behind, so a free-running sender clock drifts against a cushion instead of
+    /// underrunning continuously.
     ///
     /// Returns the number of frames dropped alongside the result.
     pub fn push_realtime(&self, kind: SourceKind, frames: &[Frame]) -> (PushResult, usize) {
         if !self.is_owner(kind) {
             return (PushResult::Preempted, frames.len());
         }
-        let mut producer = self.producer.lock().unwrap();
-        if !producer.is_consumer_alive() {
-            return (PushResult::Disconnected, frames.len());
-        }
-        if self.realtime_target_frames > 0 {
-            let queued = producer.occupied_len();
-            if queued < self.realtime_target_frames / 4 {
-                producer.push_silence(self.realtime_target_frames - queued);
-            }
-        }
-        let pushed = producer.push_some(frames);
-        (PushResult::Written, frames.len() - pushed)
+        let written = self.sink.write_realtime(frames);
+        (PushResult::Written, frames.len() - written)
     }
 
-    /// Ask the ring writer to drop everything queued (AirPlay flush / seek).
+    /// Drop everything written but not yet transmitted (AirPlay flush / seek).
     pub fn flush(&self) {
-        self.discard.request();
+        self.sink.reset();
     }
 }
 
@@ -365,7 +328,7 @@ pub fn speaker_id(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::queue;
+    use crate::dante::SpeakerSink;
     use std::sync::atomic::AtomicUsize;
 
     struct FakeControl {
@@ -403,7 +366,9 @@ mod tests {
         }
     }
 
-    fn audio(prefill: usize) -> (Arc<SpeakerAudio>, queue::QueueConsumer) {
+    /// A speaker whose sink has no device behind it: writes go nowhere, which is all
+    /// these tests need (they exercise arbitration, not audio).
+    fn audio() -> Arc<SpeakerAudio> {
         let hub = StateHub::new();
         hub.register(crate::state::SpeakerState::new(
             "kitchen".into(),
@@ -411,20 +376,17 @@ mod tests {
             true,
             vec![SourceKind::Spotify, SourceKind::Airplay],
         ));
-        let (prod, cons) = queue::channel(4096);
-        let audio = Arc::new(SpeakerAudio::new(
+        Arc::new(SpeakerAudio::new(
             "kitchen".into(),
             "Kitchen".into(),
             hub,
-            prod,
-            prefill,
-        ));
-        (audio, cons)
+            Arc::new(SpeakerSink::detached()),
+        ))
     }
 
     #[test]
     fn claim_preempts_and_yields_the_loser() {
-        let (audio, _cons) = audio(0);
+        let audio = audio();
         let spotify_yields = Arc::new(AtomicUsize::new(0));
         let airplay_yields = Arc::new(AtomicUsize::new(0));
         audio.register_control(Arc::new(FakeControl {
@@ -456,7 +418,7 @@ mod tests {
 
     #[test]
     fn release_only_affects_the_current_owner() {
-        let (audio, _cons) = audio(0);
+        let audio = audio();
         audio.claim(SourceKind::Spotify);
         audio.release(SourceKind::Airplay);
         assert_eq!(audio.owner(), Some(SourceKind::Spotify));
@@ -466,7 +428,7 @@ mod tests {
 
     #[test]
     fn non_owner_pushes_are_dropped() {
-        let (audio, mut cons) = audio(0);
+        let audio = audio();
         audio.claim(SourceKind::Airplay);
 
         assert_eq!(
@@ -476,48 +438,6 @@ mod tests {
         let (result, dropped) = audio.push_realtime(SourceKind::Spotify, &[[1, 1], [2, 2]]);
         assert_eq!(result, PushResult::Preempted);
         assert_eq!(dropped, 2);
-
-        let (result, dropped) = audio.push_realtime(SourceKind::Airplay, &[[7, 8]]);
-        assert_eq!(result, PushResult::Written);
-        assert_eq!(dropped, 0);
-        // Only the owner's frame made it into the queue.
-        assert_eq!(cons.pop(), Some([7, 8]));
-        assert_eq!(cons.pop(), None);
-    }
-
-    #[test]
-    fn realtime_push_reports_drops_when_full() {
-        let (audio, _cons) = audio(0);
-        audio.claim(SourceKind::Airplay);
-        let frames = vec![[1, 1]; 5000];
-        let (result, dropped) = audio.push_realtime(SourceKind::Airplay, &frames);
-        assert_eq!(result, PushResult::Written);
-        // Capacity is 4096, so the tail is dropped rather than blocking.
-        assert_eq!(dropped, 5000 - 4096);
-    }
-
-    #[test]
-    fn realtime_push_tops_the_queue_up_to_target() {
-        let (audio, mut cons) = audio(1024);
-        audio.claim(SourceKind::Airplay);
-        // The claim's discard drains whatever the displaced source left behind; the
-        // cushion is (re)built by the next push, so it survives that drain.
-        assert!(cons.take_discard_request());
-
-        let (result, dropped) = audio.push_realtime(SourceKind::Airplay, &[[7, 8]]);
-        assert_eq!(result, PushResult::Written);
-        assert_eq!(dropped, 0);
-        // Still cushioned, so this push adds no further silence.
-        audio.push_realtime(SourceKind::Airplay, &[[9, 9]]);
-
-        // Exactly one cushion, then both real frames in order.
-        let mut silence = 0;
-        while cons.pop() == Some([0, 0]) {
-            silence += 1;
-        }
-        assert_eq!(silence, 1024);
-        assert_eq!(cons.pop(), Some([9, 9]));
-        assert_eq!(cons.pop(), None);
     }
 
     #[test]

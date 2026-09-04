@@ -8,7 +8,7 @@
 //! Otherwise an FFT resampler with a fixed input chunk is fed from an accumulation
 //! buffer, since sources deliver variable-sized packets.
 
-use super::queue::Frame;
+use crate::dante::Frame;
 use inferno_aoip::device_server::Sample;
 use rubato::{FftFixedIn, Resampler};
 
